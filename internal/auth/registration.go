@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 
+	awshardening "github.com/cynative/cynative/internal/auth/aws"
 	githubhardening "github.com/cynative/cynative/internal/auth/github"
 	gitlabclass "github.com/cynative/cynative/internal/auth/gitlab"
 )
@@ -25,6 +27,9 @@ type registrationDeps struct {
 	fileExists             func(string) bool
 	homeDir                string
 	awsDefaultProfileCreds bool
+	// scopeNotifyOut receives the one-line startup credential-scope degrade notice
+	// for AWS. Set to os.Stderr in buildRegistrationDeps and io.Discard in stubDeps.
+	scopeNotifyOut io.Writer
 
 	tokenForHost   func(ctx context.Context) (token string, present bool, err error)
 	validateGithub func(ctx context.Context, token string) (login string, err error)
@@ -33,29 +38,32 @@ type registrationDeps struct {
 	buildGitLab    func(cfg GitLabHardeningConfig, host string, cred glabCredential) (*gitlabProvider, error)
 	validateGitLab func(ctx context.Context, p *gitlabProvider) (username string, err error)
 
-	loadAWS         func(context.Context) (aws.Config, error)
-	retrieveAWS     func(context.Context, aws.Config) error
-	validateAWS     func(context.Context, aws.Config) (string, string, string, error) // display, rawARN, account, err.
-	resolveScopeAWS func(ctx context.Context, account, rawARN string, cfg aws.Config) (string, aws.CredentialsProvider)
-	buildAWS        func(aws.Config, aws.CredentialsProvider) (*awsProvider, *eksProvider)
-	awsPosture      string
+	loadAWS           func(context.Context) (aws.Config, error)
+	retrieveAWS       func(context.Context, aws.Config) error
+	validateAWS       func(context.Context, aws.Config) (string, string, string, error) // display, rawARN, account, err.
+	resolveScopeAWS   func(ctx context.Context, account, rawARN string, cfg aws.Config) (awshardening.ScopeResult, aws.CredentialsProvider)
+	buildAWS          func(aws.Config, aws.CredentialsProvider) (*awsProvider, *eksProvider)
+	awsPolicyARN      string
+	validateAWSPolicy func(ctx context.Context, cfg aws.Config, policyARN string) error
 
-	findGCP     func(context.Context) (*google.Credentials, error)
-	probeGCP    func(context.Context) error
-	gcpIdentity func(context.Context, *google.Credentials) string
-	buildGCP    func(*google.Credentials) (*gcpProvider, *gkeProvider)
-	gcpPosture  string
+	findGCP         func(context.Context) (*google.Credentials, error)
+	probeGCP        func(context.Context) error
+	gcpIdentity     func(context.Context, *google.Credentials) string
+	buildGCP        func(*google.Credentials) (*gcpProvider, *gkeProvider)
+	gcpRole         string
+	validateGCPRole func(ctx context.Context, role string) error
 
-	newAzure      func() (azcore.TokenCredential, error)
-	probeAzure    func(context.Context, azcore.TokenCredential) error
-	azureIdentity func(context.Context, azcore.TokenCredential) string
-	buildAzure    func(azcore.TokenCredential) (*azureProvider, *aksProvider)
-	azurePosture  string
+	newAzure            func() (azcore.TokenCredential, error)
+	probeAzure          func(context.Context, azcore.TokenCredential) error
+	azureIdentity       func(context.Context, azcore.TokenCredential) string
+	buildAzure          func(azcore.TokenCredential) (*azureProvider, *aksProvider)
+	azureRoleDefinition string
+	validateAzureRole   func(ctx context.Context, cred azcore.TokenCredential, roleDef string) (string, error)
 
-	loadKube   func() (resolvedCluster, error, error)
-	buildKube  func(resolvedCluster) *kubernetesProvider
-	probeKube  func(ctx context.Context, p *kubernetesProvider) error
-	k8sPosture string
+	loadKube       func() (resolvedCluster, error, error)
+	buildKube      func(resolvedCluster) *kubernetesProvider
+	probeKube      func(ctx context.Context, p *kubernetesProvider) error
+	k8sClusterRole string
 }
 
 // identityProbeTimeout bounds each connector's display-only identity capture so a
@@ -104,17 +112,20 @@ func boundedIdentity(ctx context.Context, timeout time.Duration, fn func(context
 // resolves it (which does NOT contact AWS for static env/file keys) and STS
 // GetCallerIdentity is the live liveness check that also yields the display
 // identity. On a successful probe the eager scope resolution runs fail-soft to
-// determine the sts= label and build the pre-scoped credential chain. The probe
-// is ctx-bounded and retried once on a transient error. A load failure is always
-// loud; a credential failure is explicit-gated, escalated to loud when transient.
+// determine the enforced= token and build the pre-scoped credential chain. The
+// probe is ctx-bounded and retried once on a transient error. A load failure is
+// always loud; a credential failure is explicit-gated, escalated to loud when
+// transient. A ceiling-validation failure (policy) is always loud regardless of
+// explicit/verbose: the credential is confirmed present, so it is never ambient.
 func (d *registrationDeps) registerAWS(ctx context.Context, verbose bool) connectorOutcome {
 	cfg, loadErr := d.loadAWS(ctx)
 
 	var (
-		credErr  error
-		identity string
-		stsLabel string
-		scoped   aws.CredentialsProvider
+		credErr     error
+		identity    string
+		rawARN      string
+		scopeResult awshardening.ScopeResult
+		scoped      aws.CredentialsProvider
 	)
 	if loadErr == nil {
 		pctx, cancel := context.WithTimeout(ctx, credentialProbeTimeout)
@@ -124,14 +135,15 @@ func (d *registrationDeps) registerAWS(ctx context.Context, verbose bool) connec
 			if err := d.retrieveAWS(pctx, cfg); err != nil {
 				return err
 			}
-			display, rawARN, account, err := d.validateAWS(pctx, cfg) // GCI: liveness + identity, bounded by pctx.
+			display, arn, account, err := d.validateAWS(pctx, cfg) // GCI: liveness + identity, bounded by pctx.
 			if err != nil {
 				return err
 			}
 			identity = display
+			rawARN = arn
 			// Eager scope is fail-soft (never returns an error), so it does not
 			// trigger a retry and runs exactly once on the successful probe.
-			stsLabel, scoped = d.resolveScopeAWS(pctx, account, rawARN, cfg)
+			scopeResult, scoped = d.resolveScopeAWS(pctx, account, rawARN, cfg)
 
 			return nil
 		})
@@ -144,9 +156,23 @@ func (d *registrationDeps) registerAWS(ctx context.Context, verbose bool) connec
 			escalateForTransient(policy, cmpErr(loadErr, credErr)), msg)
 	}
 
+	vctx, vcancel := context.WithTimeout(ctx, ceilingValidationTimeout)
+	defer vcancel()
+	if verr := retryProbe(func() error { return d.validateAWSPolicy(vctx, cfg, d.awsPolicyARN) }); verr != nil {
+		explicit := awsExplicitlyConfigured(d.lookupEnv, d.fileExists, d.homeDir, d.awsDefaultProfileCreds)
+
+		return skipOutcome(awsProviderName, explicit, verbose,
+			emitAlways,
+			fmt.Sprintf("aws_hardening: skipped (policy validation failed): %v", verr))
+	}
+
+	if msg, emit := awsScopeDegraded(awshardening.DetectCredScope(rawARN), scopeResult); emit {
+		fmt.Fprint(d.scopeNotifyOut, msg)
+	}
+
 	awsProv, eks := d.buildAWS(cfg, scoped)
-	// d.awsPosture is "policy=<full ARN>" (B1c); append the eager sts= label.
-	status := availStatus(awsProviderName, d.awsPosture+" · sts="+stsLabel, identity, false)
+	posture := buildPosture(awsAccess(d.awsPolicyARN), awsEnforced(scopeResult), awsPostureLabel(d.awsPolicyARN))
+	status := availStatus(awsProviderName, posture, identity, false)
 	status.Managed = eksProviderName
 
 	return connectorOutcome{
@@ -156,11 +182,25 @@ func (d *registrationDeps) registerAWS(ctx context.Context, verbose bool) connec
 	}
 }
 
+// awsScopeDegraded reports the startup degrade notice for an assumed-role identity
+// whose eager credential scoping fell back to unscoped. It returns ("", false)
+// for IAM-user/root (unscoped by design) and for a scope that stayed in force.
+func awsScopeDegraded(decision awshardening.CredScopeDecision, result awshardening.ScopeResult) (string, bool) {
+	if decision.Mode != awshardening.CredScopeAssumeRole || result.Mode != awshardening.CredScopeDisabled {
+		return "", false
+	}
+
+	return fmt.Sprintf("⚠️ aws_hardening: cred_scope degraded to disabled (reason=%s) — "+
+		"requests run with full base AWS credentials, gated client-side only.\n", result.Reason), true
+}
+
 // registerGCP discovers ADC and validates it by minting a token (the live check)
 // regardless of explicit config, so a host whose ADC/metadata source cannot
 // actually mint a token is not registered. The probe is ctx-bounded and retried
-// once on a transient error. Any skip is explicit-gated, escalated to loud when
-// transient. On success it captures a bounded, display-only identity.
+// once on a transient error. A credential skip is explicit-gated, escalated to
+// loud when transient. A ceiling-validation failure (role) is always loud
+// regardless of explicit/verbose: the credential is confirmed present. On
+// success it captures a bounded, display-only identity.
 func (d *registrationDeps) registerGCP(ctx context.Context, verbose bool) connectorOutcome {
 	// findGCP MUST use the unbounded ctx: google.FindDefaultCredentials' returned
 	// TokenSource retains the supplied context, and the registered provider mints
@@ -184,12 +224,23 @@ func (d *registrationDeps) registerGCP(ctx context.Context, verbose bool) connec
 			escalateForTransient(emitWhenExplicitOrVerbose, cmpErr(findErr, probeErr)), msg)
 	}
 
+	vctx, vcancel := context.WithTimeout(ctx, ceilingValidationTimeout)
+	defer vcancel()
+	if verr := retryProbe(func() error { return d.validateGCPRole(vctx, d.gcpRole) }); verr != nil {
+		explicit := gcpExplicitlyConfigured(d.lookupEnv, d.fileExists, d.homeDir)
+
+		return skipOutcome(gcpProviderName, explicit, verbose,
+			emitAlways,
+			fmt.Sprintf("gcp_hardening: skipped (role validation failed): %v", verr))
+	}
+
 	identity := boundedIdentity(ctx, identityProbeTimeout, func(ictx context.Context) string {
 		return d.gcpIdentity(ictx, creds)
 	})
 	gcpProv, gke := d.buildGCP(creds)
 
-	status := availStatus(gcpProviderName, d.gcpPosture, identity, false)
+	posture := buildPosture(gcpAccess(d.gcpRole), enforcedClient, gcpPostureLabel(d.gcpRole))
+	status := availStatus(gcpProviderName, posture, identity, false)
 	status.Managed = gkeProviderName
 
 	return connectorOutcome{
@@ -203,9 +254,11 @@ func (d *registrationDeps) registerGCP(ctx context.Context, verbose bool) connec
 // token (the live check) regardless of explicit config — removing the prior
 // optimistic registration, so a host with no usable Azure credential is not
 // registered. The probe is ctx-bounded and retried once on a transient error.
-// Any skip is explicit-gated, escalated to loud when transient. On success it
-// captures a bounded, display-only identity. The credential chain is unchanged
-// (its own subprocess auth — az/azd/pwsh — is acceptable).
+// A credential skip is explicit-gated, escalated to loud when transient. A
+// ceiling-validation failure (role definition) is always loud regardless of
+// explicit/verbose: the credential is confirmed present. On success it captures
+// a bounded, display-only identity. The credential chain is unchanged (its own
+// subprocess auth — az/azd/pwsh — is acceptable).
 func (d *registrationDeps) registerAzure(ctx context.Context, verbose bool) connectorOutcome {
 	cred, chainErr := d.newAzure()
 
@@ -224,12 +277,32 @@ func (d *registrationDeps) registerAzure(ctx context.Context, verbose bool) conn
 			escalateForTransient(emitWhenExplicitOrVerbose, cmpErr(chainErr, probeErr)), msg)
 	}
 
+	vctx, vcancel := context.WithTimeout(ctx, ceilingValidationTimeout)
+	defer vcancel()
+	var guid string
+	if verr := retryProbe(func() error {
+		g, e := d.validateAzureRole(vctx, cred, d.azureRoleDefinition)
+		guid = g
+		return e
+	}); verr != nil {
+		explicit := azureExplicitlyConfigured(d.lookupEnv)
+
+		return skipOutcome(azureProviderName, explicit, verbose,
+			emitAlways,
+			fmt.Sprintf("azure_hardening: skipped (role definition validation failed): %v", verr))
+	}
+
 	identity := boundedIdentity(ctx, identityProbeTimeout, func(ictx context.Context) string {
 		return d.azureIdentity(ictx, cred)
 	})
 	azureProv, aks := d.buildAzure(cred)
 
-	status := availStatus(azureProviderName, d.azurePosture, identity, false)
+	posture := buildPosture(
+		azureAccess(d.azureRoleDefinition),
+		enforcedClient,
+		azurePostureLabel(d.azureRoleDefinition, guid),
+	)
+	status := availStatus(azureProviderName, posture, identity, false)
 	status.Managed = aksProviderName
 
 	return connectorOutcome{
@@ -267,9 +340,11 @@ func (d *registrationDeps) registerKube(verbose bool) connectorOutcome {
 			fmt.Sprintf("kubernetes_hardening: skipped (cluster validation failed): %v", err))
 	}
 
+	posture := buildPosture(k8sAccess(d.k8sClusterRole), enforcedClient, k8sPostureLabel(d.k8sClusterRole))
+
 	return connectorOutcome{
 		providers: []Provider{p},
-		statuses:  []ConnectorStatus{availStatus(kubernetesProviderName, d.k8sPosture, rc.host, false)},
+		statuses:  []ConnectorStatus{availStatus(kubernetesProviderName, posture, rc.host, false)},
 		visible:   []bool{true},
 	}
 }
@@ -313,7 +388,7 @@ func (d *registrationDeps) githubOutcome(
 	}
 
 	exposure := githubhardening.BuildExposure(ghCfg.Permissions)
-	posture, warn := githubPosture(exposure)
+	posture, warn := githubPosture(exposure, ghCfg.Permissions)
 	gh := newGithubProvider(token, exposure, githubhardening.NewTableSource(ghCfg.Config, newGithubOpenAPIFetcher()))
 	gh.errOut = os.Stderr
 
@@ -369,7 +444,7 @@ func (d *registrationDeps) gitlabOutcome(
 	}
 
 	exposure := gitlabclass.BuildExposure(glCfg.Permissions)
-	posture, warn := gitlabPosture(exposure)
+	posture, warn := gitlabPosture(exposure, glCfg.Permissions)
 
 	return connectorOutcome{
 		providers: []Provider{gl},

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	awshardening "github.com/cynative/cynative/internal/auth/aws"
 	"github.com/cynative/cynative/internal/auth/exposure"
 	githubhardening "github.com/cynative/cynative/internal/auth/github"
 	gitlabclass "github.com/cynative/cynative/internal/auth/gitlab"
@@ -53,11 +54,58 @@ func TestGcpPostureLabel(t *testing.T) {
 	}
 }
 
-func TestAzurePostureLabel(t *testing.T) {
+func TestAzurePostureLabel_WithGUID(t *testing.T) {
 	t.Parallel()
 
-	if got := azurePostureLabel("Reader"); got != "role definition=Reader" {
-		t.Errorf("got %q, want role definition=Reader", got)
+	got := azurePostureLabel("Reader", "acdd72a7-3385-48ef-bd42-f606fba81ae7")
+	want := "role definition=Reader (acdd72a7-3385-48ef-bd42-f606fba81ae7)"
+	if got != want {
+		t.Fatalf("azurePostureLabel = %q, want %q", got, want)
+	}
+}
+
+func TestAWSEnforced(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		r    awshardening.ScopeResult
+		want string
+	}{
+		{
+			name: "verified assume-role",
+			r: awshardening.ScopeResult{ //nolint:exhaustruct // mode+verified.
+				Mode:     awshardening.CredScopeAssumeRole,
+				Verified: true,
+			},
+			want: enforcedClientAWS,
+		},
+		{
+			name: "unverified assume-role",
+			r: awshardening.ScopeResult{ //nolint:exhaustruct // mode only.
+				Mode: awshardening.CredScopeAssumeRole,
+			},
+			want: enforcedClientAWSUnverified,
+		},
+		{
+			name: "disabled",
+			r:    awshardening.ScopeResult{Mode: awshardening.CredScopeDisabled}, //nolint:exhaustruct // mode only.
+			want: enforcedClient,
+		},
+	}
+	for _, tc := range cases {
+		if got := awsEnforced(tc.r); got != tc.want {
+			t.Errorf("%s: awsEnforced = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestGithubPosture_AccessPrefix(t *testing.T) {
+	t.Parallel()
+
+	posture, _ := githubPosture(githubhardening.BuildExposure(nil), nil)
+	if !strings.HasPrefix(posture, "access=default(read-only) · enforced=client · permissions=") {
+		t.Fatalf("githubPosture = %q", posture)
 	}
 }
 
@@ -72,13 +120,14 @@ func TestK8sPostureLabel(t *testing.T) {
 func TestGithubPosture(t *testing.T) {
 	t.Parallel()
 
-	if p, w := githubPosture(githubhardening.BaselineExposure()); w ||
-		p != "permissions=default=read,secret-scanning=none" {
-		t.Errorf("githubPosture(baseline) = (%q,%v), want quiet permissions scalar", p, w)
+	if p, w := githubPosture(githubhardening.BaselineExposure(), nil); w ||
+		p != "access=default(read-only) · enforced=client · permissions=default=read,secret-scanning=none" {
+		t.Errorf("githubPosture(baseline) = (%q,%v), want quiet full posture", p, w)
 	}
+	loudMap := map[string]string{"issues": "write"}
 	loud := exposure.MergeExposure(githubhardening.BaselineExposure(), exposure.Exposure{"issues": exposure.LevelWrite})
-	if p, w := githubPosture(loud); !w ||
-		p != "permissions=default=read,issues=write,secret-scanning=none" {
+	if p, w := githubPosture(loud, loudMap); !w ||
+		p != "access=custom · enforced=client · permissions=default=read,issues=write,secret-scanning=none" {
 		t.Errorf("githubPosture(write) = (%q,%v), want loud override scalar", p, w)
 	}
 }
@@ -86,13 +135,14 @@ func TestGithubPosture(t *testing.T) {
 func TestGitlabPosture(t *testing.T) {
 	t.Parallel()
 
-	if p, w := gitlabPosture(gitlabclass.BaselineExposure()); w ||
-		p != "permissions=default=read,ci-variables=none" {
-		t.Errorf("gitlabPosture(baseline) = (%q,%v), want quiet permissions scalar", p, w)
+	if p, w := gitlabPosture(gitlabclass.BaselineExposure(), nil); w ||
+		p != "access=default(read-only) · enforced=client · permissions=default=read,ci-variables=none" {
+		t.Errorf("gitlabPosture(baseline) = (%q,%v), want quiet full posture", p, w)
 	}
+	loudMap := map[string]string{"default": "write"}
 	loud := exposure.MergeExposure(gitlabclass.BaselineExposure(), exposure.Exposure{"default": exposure.LevelWrite})
-	if p, w := gitlabPosture(loud); !w ||
-		p != "permissions=default=write,ci-variables=none" {
+	if p, w := gitlabPosture(loud, loudMap); !w ||
+		p != "access=custom · enforced=client · permissions=default=write,ci-variables=none" {
 		t.Errorf("gitlabPosture(write) = (%q,%v), want loud default=write scalar", p, w)
 	}
 }
@@ -198,5 +248,53 @@ func TestDriveConcurrent_NilOnStatus(t *testing.T) {
 	}, nil)
 	if len(got) != 1 {
 		t.Errorf("accumulated %d providers, want 1 (nil onStatus must not panic)", len(got))
+	}
+}
+
+func TestBuildPosture(t *testing.T) {
+	t.Parallel()
+
+	got := buildPosture(accessDefault, enforcedClient, "role=roles/viewer")
+	want := "access=default(read-only) · enforced=client · role=roles/viewer"
+	if got != want {
+		t.Fatalf("buildPosture = %q, want %q", got, want)
+	}
+}
+
+func TestAccessHelpers(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		got  string
+		want string
+	}{
+		{"aws default", awsAccess(defaultAWSPolicyARN), accessDefault},
+		{"aws custom", awsAccess("arn:aws:iam::123456789012:policy/My"), accessCustom},
+		{"gcp default", gcpAccess(defaultGCPRole), accessDefault},
+		{"gcp custom", gcpAccess("roles/editor"), accessCustom},
+		{"azure default exact", azureAccess("Reader"), accessDefault},
+		{"azure default casefold", azureAccess("reader"), accessDefault},
+		{"azure custom guid", azureAccess("acdd72a7-3385-48ef-bd42-f606fba81ae7"), accessCustom},
+		{"k8s default", k8sAccess("view"), accessDefault},
+		{"k8s custom", k8sAccess("edit"), accessCustom},
+		{"exposure default (nil)", exposureAccess(nil), accessDefault},
+		{"exposure default (empty)", exposureAccess(map[string]string{}), accessDefault},
+		{"exposure custom", exposureAccess(map[string]string{"issues": "write"}), accessCustom},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+func TestManagedK8sPosture(t *testing.T) {
+	t.Parallel()
+
+	got := ManagedK8sPosture("view")
+	want := "access=default(read-only) · enforced=client · cluster role=view"
+	if got != want {
+		t.Fatalf("ManagedK8sPosture = %q, want %q", got, want)
 	}
 }

@@ -10,6 +10,27 @@ import (
 	awshardening "github.com/cynative/cynative/internal/auth/aws"
 )
 
+// validateAWSPolicy confirms the configured IAM policy is fetchable and that the
+// caller can invoke iam:SimulateCustomPolicy — the permission the request-time
+// action gate depends on. Shell: real IAM client.
+func validateAWSPolicy(ctx context.Context, cfg aws.Config, policyARN string) error {
+	cfg.Region = resolveRegion(cfg.Region)
+	client := iam.NewFromConfig(cfg)
+	doc, ver, err := awshardening.FetchPolicyDocument(ctx, client, policyARN)
+	if err != nil {
+		return err
+	}
+	// Confirm the caller holds iam:SimulateCustomPolicy — the permission the
+	// request-time action gate depends on; a benign action whose allow/deny
+	// verdict is irrelevant (only an API-call error fails validation).
+	eval := awshardening.NewPolicyEvaluator(doc, ver, client, 1)
+	if _, serr := eval.AllowedAll(ctx, []string{"iam:GetUser"}); serr != nil {
+		return serr
+	}
+
+	return nil
+}
+
 // buildHardenedAWSProvider constructs the hardened *awsProvider with all AWS
 // I/O deferred to first use. The provider's doLazyResolve closure captures
 // pre-built dependency clients (cheap, no I/O) and triggers LazyResolve on

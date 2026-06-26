@@ -1,9 +1,11 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -16,6 +18,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 
+	awshardening "github.com/cynative/cynative/internal/auth/aws"
 	githubhardening "github.com/cynative/cynative/internal/auth/github"
 	gitlabclass "github.com/cynative/cynative/internal/auth/gitlab"
 )
@@ -48,7 +51,8 @@ func wantLoudSkip(t *testing.T, out connectorOutcome) {
 // stubDeps returns a registrationDeps whose seams all succeed and whose builders
 // return non-nil stub providers. Individual tests override the fields they probe.
 func stubDeps() *registrationDeps {
-	return &registrationDeps{ //nolint:exhaustruct // posture labels default empty.
+	return &registrationDeps{ //nolint:exhaustruct // posture labels default empty; scopeNotifyOut set to Discard.
+		scopeNotifyOut: io.Discard,
 		lookupEnv:      envFrom(nil),
 		fileExists:     func(string) bool { return false },
 		homeDir:        "/home/u",
@@ -70,23 +74,28 @@ func stubDeps() *registrationDeps {
 		validateAWS: func(context.Context, aws.Config) (string, string, string, error) {
 			return "123 · arn:aws:iam::123:user/u", "arn:aws:iam::123:user/u", "123", nil
 		},
-		resolveScopeAWS: func(context.Context, string, string, aws.Config) (string, aws.CredentialsProvider) {
-			return "disabled", nil
+		resolveScopeAWS: func(context.Context, string, string, aws.Config) (awshardening.ScopeResult, aws.CredentialsProvider) {
+			return awshardening.ScopeResult{Mode: awshardening.CredScopeDisabled}, nil //nolint:exhaustruct // bare.
 		},
 		buildAWS: func(aws.Config, aws.CredentialsProvider) (*awsProvider, *eksProvider) {
 			return &awsProvider{}, &eksProvider{} //nolint:exhaustruct // bare.
 		},
-		findGCP:       func(context.Context) (*google.Credentials, error) { return &google.Credentials{}, nil }, //nolint:exhaustruct // zero.
-		probeGCP:      func(context.Context) error { return nil },
-		gcpIdentity:   func(context.Context, *google.Credentials) string { return "proj · me@x" },
-		buildGCP:      func(*google.Credentials) (*gcpProvider, *gkeProvider) { return &gcpProvider{}, &gkeProvider{} }, //nolint:exhaustruct // bare.
-		newAzure:      func() (azcore.TokenCredential, error) { return fakeTokenCred{}, nil },
-		probeAzure:    func(context.Context, azcore.TokenCredential) error { return nil },
-		azureIdentity: func(context.Context, azcore.TokenCredential) string { return "me@tenant" },
-		buildAzure:    func(azcore.TokenCredential) (*azureProvider, *aksProvider) { return &azureProvider{}, &aksProvider{} }, //nolint:exhaustruct // bare.
-		loadKube:      func() (resolvedCluster, error, error) { return resolvedCluster{}, nil, nil },                           //nolint:exhaustruct // zero.
-		buildKube:     func(resolvedCluster) *kubernetesProvider { return &kubernetesProvider{} },                              //nolint:exhaustruct // bare.
-		probeKube:     func(context.Context, *kubernetesProvider) error { return nil },
+		findGCP:           func(context.Context) (*google.Credentials, error) { return &google.Credentials{}, nil }, //nolint:exhaustruct // zero.
+		probeGCP:          func(context.Context) error { return nil },
+		gcpIdentity:       func(context.Context, *google.Credentials) string { return "proj · me@x" },
+		buildGCP:          func(*google.Credentials) (*gcpProvider, *gkeProvider) { return &gcpProvider{}, &gkeProvider{} }, //nolint:exhaustruct // bare.
+		newAzure:          func() (azcore.TokenCredential, error) { return fakeTokenCred{}, nil },
+		probeAzure:        func(context.Context, azcore.TokenCredential) error { return nil },
+		azureIdentity:     func(context.Context, azcore.TokenCredential) string { return "me@tenant" },
+		buildAzure:        func(azcore.TokenCredential) (*azureProvider, *aksProvider) { return &azureProvider{}, &aksProvider{} }, //nolint:exhaustruct // bare.
+		loadKube:          func() (resolvedCluster, error, error) { return resolvedCluster{}, nil, nil },                           //nolint:exhaustruct // zero.
+		buildKube:         func(resolvedCluster) *kubernetesProvider { return &kubernetesProvider{} },                              //nolint:exhaustruct // bare.
+		probeKube:         func(context.Context, *kubernetesProvider) error { return nil },
+		validateAWSPolicy: func(context.Context, aws.Config, string) error { return nil },
+		validateGCPRole:   func(context.Context, string) error { return nil },
+		validateAzureRole: func(context.Context, azcore.TokenCredential, string) (string, error) {
+			return "acdd72a7-3385-48ef-bd42-f606fba81ae7", nil
+		},
 	}
 }
 
@@ -599,7 +608,7 @@ func TestGithubOutcome(t *testing.T) {
 		d := stubDeps()
 		cfg := GithubHardeningConfig{Permissions: map[string]string{"default": "write"}}
 		got := d.githubOutcome(context.Background(), cfg, false)
-		wantPosture, _ := githubPosture(githubhardening.BuildExposure(cfg.Permissions))
+		wantPosture, _ := githubPosture(githubhardening.BuildExposure(cfg.Permissions), cfg.Permissions)
 		if len(got.providers) != 1 || !got.statuses[0].Available ||
 			!got.statuses[0].Warn || got.statuses[0].Posture != wantPosture {
 			t.Fatalf("want registered + Warn=true + Posture=%q, got %+v", wantPosture, got)
@@ -662,7 +671,7 @@ func TestGitlabOutcome(t *testing.T) {
 		//nolint:exhaustruct // only permissions.
 		cfg := GitLabHardeningConfig{Permissions: map[string]string{"default": "write"}}
 		got := d.gitlabOutcome(context.Background(), cfg, false)
-		wantPosture, _ := gitlabPosture(gitlabclass.BuildExposure(cfg.Permissions))
+		wantPosture, _ := gitlabPosture(gitlabclass.BuildExposure(cfg.Permissions), cfg.Permissions)
 		if !got.statuses[0].Warn || got.statuses[0].Posture != wantPosture {
 			t.Fatalf("want Warn=true + Posture=%q, got %+v", wantPosture, got)
 		}
@@ -760,29 +769,249 @@ func TestRegisterAWS_ScopeDegraded_rendersDisabledStillAvailable(t *testing.T) {
 	d.validateAWS = func(context.Context, aws.Config) (string, string, string, error) {
 		return "123 · arn:aws:sts::123:assumed-role/SSO/sess", "arn:aws:sts::123:assumed-role/SSO/sess", "123", nil
 	}
-	d.resolveScopeAWS = func(context.Context, string, string, aws.Config) (string, aws.CredentialsProvider) {
-		return "disabled (degraded: assume_role_unavailable)", nil
+	d.resolveScopeAWS = func(context.Context, string, string, aws.Config) (awshardening.ScopeResult, aws.CredentialsProvider) {
+		return awshardening.ScopeResult{ //nolint:exhaustruct // mode+reason only.
+			Mode:   awshardening.CredScopeDisabled,
+			Reason: "assume_role_unavailable",
+		}, nil
 	}
 	out := d.registerAWS(context.Background(), false)
 	if len(out.providers) != 2 || !out.statuses[0].Available {
 		t.Fatalf("degrade must keep AWS available: %+v", out)
 	}
-	if !strings.Contains(out.statuses[0].Posture, "sts=disabled (degraded:") {
-		t.Fatalf("posture=%q, want sts=disabled (degraded: …)", out.statuses[0].Posture)
+	if !strings.Contains(out.statuses[0].Posture, "enforced=client ·") {
+		t.Fatalf("posture=%q, want enforced=client · …", out.statuses[0].Posture)
 	}
 }
 
-func TestRegisterAWS_ScopeAssumeRole_rendersStsLabel(t *testing.T) {
+func TestRegisterAWS_ScopeAssumeRole_rendersEnforcedLabel(t *testing.T) {
 	t.Parallel()
 	d := stubDeps()
 	d.validateAWS = func(context.Context, aws.Config) (string, string, string, error) {
 		return "123 · arn:aws:iam::123:user/u", "arn:aws:iam::123:user/u", "123", nil
 	}
-	d.resolveScopeAWS = func(context.Context, string, string, aws.Config) (string, aws.CredentialsProvider) {
-		return "assume_role", nil
+	d.resolveScopeAWS = func(context.Context, string, string, aws.Config) (awshardening.ScopeResult, aws.CredentialsProvider) {
+		return awshardening.ScopeResult{ //nolint:exhaustruct // mode+verified only.
+			Mode:     awshardening.CredScopeAssumeRole,
+			Verified: true,
+		}, nil
 	}
 	out := d.registerAWS(context.Background(), false)
-	if !strings.Contains(out.statuses[0].Posture, "· sts=assume_role") {
-		t.Fatalf("posture=%q, want policy=… · sts=assume_role", out.statuses[0].Posture)
+	if !strings.Contains(out.statuses[0].Posture, "enforced=client+aws ·") {
+		t.Fatalf("posture=%q, want enforced=client+aws · …", out.statuses[0].Posture)
 	}
+}
+
+func TestRegisterAWS_CeilingValidationFails_Skips(t *testing.T) {
+	t.Parallel()
+
+	d := stubDeps()
+	d.validateAWSPolicy = func(context.Context, aws.Config, string) error {
+		return errors.New("AccessDenied: not authorized to perform iam:GetPolicy")
+	}
+
+	out := d.registerAWS(context.Background(), true)
+
+	if len(out.providers) != 0 {
+		t.Fatalf("expected no providers on ceiling-validation failure, got %d", len(out.providers))
+	}
+	if got := out.statuses[0].Reason; !strings.Contains(got, "policy") {
+		t.Errorf("reason = %q, want a policy-validation reason", got)
+	}
+	if out.statuses[0].Available {
+		t.Errorf("connector should be unavailable")
+	}
+}
+
+func TestRegisterGCP_CeilingValidationFails_Skips(t *testing.T) {
+	t.Parallel()
+
+	d := stubDeps()
+	d.validateGCPRole = func(context.Context, string) error {
+		return errors.New("roles/viewer not found or access denied")
+	}
+
+	out := d.registerGCP(context.Background(), true)
+
+	if len(out.providers) != 0 {
+		t.Fatalf("expected no providers on ceiling-validation failure, got %d", len(out.providers))
+	}
+	if got := out.statuses[0].Reason; !strings.Contains(got, "role") {
+		t.Errorf("reason = %q, want a role-validation reason", got)
+	}
+	if out.statuses[0].Available {
+		t.Errorf("connector should be unavailable")
+	}
+}
+
+// TestCeilingValidationLoudWhenAmbient proves that a post-credential-success
+// ceiling-validation failure is LOUD (visible) even when explicit=false and
+// verbose=false. This is a credential-present-but-ceiling-broken case — never
+// an ambient absence — so it must always be shown.
+func TestCeilingValidationLoudWhenAmbient(t *testing.T) {
+	t.Parallel()
+
+	t.Run("shouldEmit(emitAlways, false, false) is true", func(t *testing.T) {
+		t.Parallel()
+		if !shouldEmit(emitAlways, false, false) {
+			t.Fatal("shouldEmit(emitAlways, false, false) must be true")
+		}
+	})
+
+	t.Run("aws ceiling failure is loud when ambient and quiet (not verbose)", func(t *testing.T) {
+		t.Parallel()
+		d := stubDeps()
+		// No explicit env: ambient (explicit=false). verbose=false.
+		d.validateAWSPolicy = func(context.Context, aws.Config, string) error {
+			return errors.New("AccessDenied: iam:SimulateCustomPolicy")
+		}
+		out := d.registerAWS(context.Background(), false)
+		if len(out.providers) != 0 {
+			t.Fatalf("expected no providers, got %d", len(out.providers))
+		}
+		if !out.visible[0] {
+			t.Fatal("ceiling-validation failure must be visible even when ambient and non-verbose")
+		}
+		if !strings.Contains(out.statuses[0].Reason, "policy") {
+			t.Fatalf("reason=%q, want a policy-validation reason", out.statuses[0].Reason)
+		}
+	})
+
+	t.Run("gcp ceiling failure is loud when ambient and quiet (not verbose)", func(t *testing.T) {
+		t.Parallel()
+		d := stubDeps()
+		// No explicit env: ambient (explicit=false). verbose=false.
+		d.validateGCPRole = func(context.Context, string) error {
+			return errors.New("roles/viewer not found")
+		}
+		out := d.registerGCP(context.Background(), false)
+		if len(out.providers) != 0 {
+			t.Fatalf("expected no providers, got %d", len(out.providers))
+		}
+		if !out.visible[0] {
+			t.Fatal("ceiling-validation failure must be visible even when ambient and non-verbose")
+		}
+		if !strings.Contains(out.statuses[0].Reason, "role") {
+			t.Fatalf("reason=%q, want a role-validation reason", out.statuses[0].Reason)
+		}
+	})
+
+	t.Run("azure ceiling failure is loud when ambient and quiet (not verbose)", func(t *testing.T) {
+		t.Parallel()
+		d := stubDeps()
+		// No explicit env: ambient (explicit=false). verbose=false.
+		d.validateAzureRole = func(context.Context, azcore.TokenCredential, string) (string, error) {
+			return "", errors.New("role definition not found")
+		}
+		out := d.registerAzure(context.Background(), false)
+		if len(out.providers) != 0 {
+			t.Fatalf("expected no providers, got %d", len(out.providers))
+		}
+		if !out.visible[0] {
+			t.Fatal("ceiling-validation failure must be visible even when ambient and non-verbose")
+		}
+		if !strings.Contains(out.statuses[0].Reason, "role") {
+			t.Fatalf("reason=%q, want a role-definition-validation reason", out.statuses[0].Reason)
+		}
+	})
+}
+
+func TestAWSScopeDegraded(t *testing.T) {
+	t.Parallel()
+
+	assumeDecision := awshardening.CredScopeDecision{
+		Mode: awshardening.CredScopeAssumeRole,
+	} //nolint:exhaustruct // mode only.
+	disabledDecision := awshardening.CredScopeDecision{
+		Mode: awshardening.CredScopeDisabled,
+	} //nolint:exhaustruct // mode only.
+	degraded := awshardening.ScopeResult{ //nolint:exhaustruct // mode+reason.
+		Mode:   awshardening.CredScopeDisabled,
+		Reason: "assume_role_unavailable",
+	}
+
+	if msg, emit := awsScopeDegraded(
+		assumeDecision,
+		degraded,
+	); !emit ||
+		!strings.Contains(msg, "assume_role_unavailable") {
+		t.Errorf("degrade not reported: %q %v", msg, emit)
+	}
+	if _, emit := awsScopeDegraded(disabledDecision, degraded); emit {
+		t.Errorf("iam-user/root should not report a degrade")
+	}
+	inForce := awshardening.ScopeResult{Mode: awshardening.CredScopeAssumeRole} //nolint:exhaustruct // mode only.
+	if _, emit := awsScopeDegraded(assumeDecision, inForce); emit {
+		t.Errorf("in-force scope should not report a degrade")
+	}
+}
+
+func TestRegisterAWS_StartupScopeDegrade_Notifies(t *testing.T) {
+	t.Parallel()
+
+	d := stubDeps()
+	// Force an assumed-role identity whose eager scoping degrades.
+	d.validateAWS = func(context.Context, aws.Config) (string, string, string, error) {
+		return "123 · arn:aws:sts::123:assumed-role/Foo/sess", "arn:aws:sts::123:assumed-role/Foo/sess", "123", nil
+	}
+	d.resolveScopeAWS = func(context.Context, string, string, aws.Config) (awshardening.ScopeResult, aws.CredentialsProvider) {
+		return awshardening.ScopeResult{
+			Mode:   awshardening.CredScopeDisabled,
+			Reason: "assume_role_unavailable",
+		}, nil //nolint:exhaustruct // mode+reason.
+	}
+	var buf bytes.Buffer
+	d.scopeNotifyOut = &buf
+
+	out := d.registerAWS(context.Background(), true)
+
+	if !out.statuses[0].Available {
+		t.Fatalf("aws should stay available on a scope degrade")
+	}
+	if !strings.Contains(out.statuses[0].Posture, "enforced=client ·") {
+		t.Errorf("degraded posture should read enforced=client, got %q", out.statuses[0].Posture)
+	}
+	if !strings.Contains(buf.String(), "cred_scope degraded") ||
+		!strings.Contains(buf.String(), "assume_role_unavailable") {
+		t.Errorf("expected degrade notice, got %q", buf.String())
+	}
+}
+
+func TestRegisterAzure_Validation(t *testing.T) {
+	t.Parallel()
+
+	t.Run("validation failure skips with reason", func(t *testing.T) {
+		t.Parallel()
+		d := stubDeps()
+		d.validateAzureRole = func(context.Context, azcore.TokenCredential, string) (string, error) {
+			return "", errors.New("role definition not found")
+		}
+		out := d.registerAzure(context.Background(), true)
+		if len(out.providers) != 0 {
+			t.Fatalf("expected no providers on ceiling-validation failure, got %d", len(out.providers))
+		}
+		if got := out.statuses[0].Reason; !strings.Contains(got, "role") {
+			t.Errorf("reason = %q, want a role-definition-validation reason", got)
+		}
+		if out.statuses[0].Available {
+			t.Errorf("connector should be unavailable")
+		}
+	})
+
+	t.Run("validation success posture contains GUID", func(t *testing.T) {
+		t.Parallel()
+		d := stubDeps()
+		const wantGUID = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
+		d.azureRoleDefinition = "Reader"
+		d.validateAzureRole = func(context.Context, azcore.TokenCredential, string) (string, error) {
+			return wantGUID, nil
+		}
+		out := d.registerAzure(context.Background(), false)
+		if len(out.providers) == 0 || !out.statuses[0].Available {
+			t.Fatalf("expected providers+available, got %+v", out)
+		}
+		if got := out.statuses[0].Posture; !strings.Contains(got, "Reader ("+wantGUID+")") {
+			t.Errorf("posture = %q, want it to contain %q", got, "Reader ("+wantGUID+")")
+		}
+	})
 }
