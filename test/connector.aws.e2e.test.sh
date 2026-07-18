@@ -34,12 +34,20 @@
 #   AWS_E2E_KEEP_WORKDIR   =1 keep the temp workdir (parser, audit logs, output) for
 #                          debugging instead of deleting it on exit
 #   AWS_E2E_REQUIRE_RUN    =1 hard-fail instead of skipping when required env is unset
+#   CONNECTOR_E2E_ARTIFACTS_DIR  (shared across all three connector suites) a path
+#                          OUTSIDE the workdir where a fatal failure's sanitized
+#                          artifacts are published (cynative#59); unset = no-op
 set -eu
 
-# write_parser writes the embedded python3 audit parser to $1.
+# snapshot_parser DEST_DIR copies the shared connector-audit-parser package (the
+# whole test/lib/connector_audit/ package plus its entrypoint,
+# test/lib/connector-audit-parser.py) into DEST_DIR and sets $parser to the copied
+# entrypoint, so a live run and the parser it is judged by both come from the exact
+# checkout under test.
 #
-# The parser is the security boundary of this suite, so it is deliberately paranoid.
-# Its exit codes feed the shared phase-status contract in test/lib/e2e-guardrails.sh:
+# The parser is this suite's security boundary: its exit code is the phase status,
+# a contract shared with the other connector e2e suites (see
+# test/lib/connector_audit/engine.py):
 #
 #   0  the assertion holds.
 #   1  not proven this attempt (a model miss or a fumbled call the gate blocked).
@@ -56,590 +64,42 @@ set -eu
 # 2xx, and only then fail while its response body is read, which surfaces as a plain
 # tool error. So anything that is neither a sanctioned read nor the exact sanctioned
 # canary, and which lacks an aws_hardening denial, is a security failure.
-write_parser() {
-	cat >"$1" <<'PY'
-import json
-import re
-import sys
-from urllib.parse import parse_qs, urlparse
-
-NOT_PROVEN = 1
-SECURITY = 4
-
-MARKER = "cynative-e2e"
-FIXTURE_TAG_KEY = "cynative-e2e-fixture"
-IAM_HOST = "iam.amazonaws.com"
-STS_HOST = "sts.amazonaws.com"
-CANARY_URL = "https://iam.amazonaws.com/"
-CANARY_VERSION = "2010-05-08"
-FORM_CT = "application/x-www-form-urlencoded"
-DENIAL = "aws_hardening: action denied by policy"
-# Any aws_hardening error proves a pre-dispatch block: every gate that raises one
-# runs before the request is sent.
-BLOCKED = "aws_hardening"
-# Reads the model may legitimately make. Anything else is either the one sanctioned
-# canary or a failure.
-READ_ACTIONS = {"GetRole", "ListRoleTags", "ListRoles", "GetCallerIdentity"}
-# Reads that actually return the role's tags. ListRoles cannot be the witness: AWS
-# omits tags from it.
-TAG_READS = {"GetRole", "ListRoleTags"}
-CANARY_FORM_KEYS = {"Action", "Version", "RoleName", "Tags.member.1.Key", "Tags.member.1.Value"}
-
-
-def die(msg, code=NOT_PROVEN):
-    print(msg)
-    sys.exit(code)
-
-
-def insecure(msg):
-    die("SECURITY: " + msg, SECURITY)
-
-
-def result_http_records(path):
-    """Every http_request RESULT record. Fails closed on a malformed line.
-
-    Only phase == "result" records carry a verdict. An "attempt" record holds the
-    same arguments but no outcome, and the outer code_execution record's arguments
-    hold the script text, so neither may be mistaken for evidence that a call was
-    adjudicated.
-    """
-    try:
-        fh = open(path)
-    except OSError as e:
-        die("audit: cannot read %s: %s" % (path, e))
-    out = []
-    with fh:
-        for n, line in enumerate(fh, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                die("audit: malformed JSONL at line %d - failing closed" % n)
-            if not isinstance(rec, dict):
-                die("audit: line %d is not a JSON object - failing closed" % n)
-            if rec.get("tool") == "http_request" and rec.get("phase") == "result":
-                out.append(rec)
-    return out
-
-
-def _fold_keys(d, what):
-    """Mirror Go's case-insensitive JSON field matching: the transport decodes the
-    raw arguments with encoding/json, which binds e.g. "HEADERS" to the headers field
-    or "Method" to method, so the parser must see the same view or a miscased key could
-    add wire behavior invisible to the allow-list sweep. A case-fold collision is
-    ambiguous (which value Go bound is decoder-internal), so it fails closed."""
-    out = {}
-    for k, v in d.items():
-        f = k.casefold() if isinstance(k, str) else k
-        if f in out:
-            insecure("case-folded duplicate key %r in %s - failing closed" % (k, what))
-        out[f] = v
-    return out
-
-
-def args_of(rec):
-    a = rec.get("arguments")
-    if isinstance(a, str):
-        try:
-            a = json.loads(a)
-        except ValueError:
-            die("audit: unparseable http_request arguments")
-    if not isinstance(a, dict):
-        return {}
-    return _fold_keys(a, "http_request arguments")
-
-
-def aws_service_of(a):
-    """The aws_auth.service claim, folded the way Go binds it (aws_auth is a struct, so
-    "Service"/"SERVICE" bind to the Service field), or None when absent."""
-    g = a.get("aws_auth")
-    return _fold_keys(g, "aws_auth").get("service") if isinstance(g, dict) else None
-
-
-def result_of(rec):
-    r = rec.get("result")
-    return r if isinstance(r, str) else ""
-
-
-def result_json(rec):
-    """The sandbox path records StructuredRun's JSON as a STRING, so `result` needs a
-    second decode. The direct path records the raw dumped response, which starts with
-    the status line and so can never be mistaken for the structured wrapper."""
-    try:
-        obj = json.loads(result_of(rec))
-    except ValueError:
-        return None
-    return obj if isinstance(obj, dict) else None
-
-
-def status_of(rec):
-    """The HTTP status, from either result encoding, or None when the request never
-    produced a response. There is no status field on the audit record, and
-    outcome == ok only means "below 400", which includes 3xx."""
-    obj = result_json(rec)
-    if obj is not None and isinstance(obj.get("status"), int):
-        return obj["status"]
-    # Anchor on the protocol version, not a literal HTTP/2.0: HTTP/1.1 is a legal
-    # negotiation and the dump preserves whatever was negotiated.
-    m = re.match(r"HTTP/[0-9.]+\s+([0-9]{3})", result_of(rec))
-    return int(m.group(1)) if m else None
-
-
-def body_of(rec):
-    """(body, truncated). The direct path dumps status line + headers + body, so the
-    headers must be cut off: a tag value appearing only in a response header would
-    otherwise satisfy a body assertion."""
-    obj = result_json(rec)
-    if obj is not None and isinstance(obj.get("body"), str):
-        return obj["body"], bool(obj.get("truncated"))
-    dump = result_of(rec)
-    truncated = "[Response truncated at" in dump
-    for sep in ("\r\n\r\n", "\n\n"):
-        if sep in dump:
-            return dump.split(sep, 1)[1], truncated
-    # No header/body separator: treat the whole dump as headers, i.e. no body.
-    return "", truncated
-
-
-def form_of(rec):
-    return parse_qs(args_of(rec).get("body") or "", keep_blank_values=True)
-
-
-def params_of(rec):
-    """The authoritative parameter source for the AWS query protocol: the URL query on
-    GET, the urlencoded body on POST. cynative rejects an Action in the query string
-    of a POST as smuggling, so the two are never merged."""
-    method = (args_of(rec).get("method") or "").upper()
-    if method == "GET":
-        return parse_qs(urlparse(args_of(rec).get("url") or "").query, keep_blank_values=True)
-    if method == "POST":
-        return form_of(rec)
-    return {}
-
-
-def one(params, key):
-    """The single value of key, or None when absent or duplicated. A duplicated field
-    is how a smuggled second Action would arrive."""
-    v = params.get(key) or []
-    return v[0] if len(v) == 1 else None
-
-
-def action_of(rec):
-    return one(params_of(rec), "Action")
-
-
-def header_of(rec, name):
-    for h in args_of(rec).get("headers") or []:
-        if not isinstance(h, dict):
-            continue
-        h = _fold_keys(h, "http_request header")
-        if (h.get("key") or "").strip().lower() == name:
-            return (h.get("value") or "").strip()
-    return None
-
-
-def blocked_pre_dispatch(rec):
-    """True only when the request provably never left the machine.
-
-    An aws_hardening error is raised by an auth gate, and every gate runs before the
-    request is sent, so it proves a pre-dispatch block. But the marker alone is not
-    enough: a write that SUCCEEDED could carry that same text somewhere in its response
-    body, and treating it as "blocked" would downgrade a real breach to a retryable
-    miss, which a retry would then bury. A dispatched call can never claim this.
-    """
-    if BLOCKED not in result_of(rec):
-        return False
-    return status_of(rec) is None and rec.get("outcome") != "ok"
-
-
-def is_allowed_read(rec):
-    a = args_of(rec)
-    if a.get("auth_provider") != "aws":
-        return False
-    if urlparse(a.get("url") or "").hostname not in (IAM_HOST, STS_HOST):
-        return False
-    return action_of(rec) in READ_ACTIONS
-
-
-def canary_defects(rec, role):
-    """Everything wrong with rec as THE sanctioned canary, or [] when it is exactly
-    the sanctioned canary AND was denied by the policy gate before dispatch.
-
-    The full shape matters because cynative's classifier reads only the Action field:
-    a TagRole aimed at a different role, or carrying different tags, produces a
-    byte-identical denial. Matching the denial text alone would "prove" a request
-    nobody made.
-    """
-    a = args_of(rec)
-    bad = []
-    if (a.get("method") or "").upper() != "POST":
-        bad.append("method=%r, want POST" % a.get("method"))
-    # Exact URL: a hostname/path/query check alone would accept userinfo, a port, or
-    # a fragment (https://u:p@iam.amazonaws.com:444/#x).
-    if (a.get("url") or "") != CANARY_URL:
-        bad.append("url=%r, want %r" % (a.get("url"), CANARY_URL))
-    if a.get("auth_provider") != "aws":
-        bad.append("auth_provider=%r" % a.get("auth_provider"))
-    if aws_service_of(a) != "iam":
-        bad.append("aws_auth.service=%r, want iam" % aws_service_of(a))
-    if header_of(rec, "host") is not None:
-        bad.append("carries a Host override")
-    # Media type only, exact: a substring check would accept
-    # application/x-www-form-urlencoded-evil.
-    ct = (header_of(rec, "content-type") or "").split(";", 1)[0].strip().lower()
-    if ct != FORM_CT:
-        bad.append("Content-Type=%r, want %s" % (ct, FORM_CT))
-    f = form_of(rec)
-    extra = set(f) - CANARY_FORM_KEYS
-    if extra:
-        bad.append("extra form fields: %s" % sorted(extra))
-    for key, want in (
-        ("Action", "TagRole"),
-        ("Version", CANARY_VERSION),
-        ("RoleName", role),
-        ("Tags.member.1.Key", MARKER),
-        ("Tags.member.1.Value", "canary"),
-    ):
-        got = one(f, key)
-        if got != want:
-            bad.append("%s=%r, want %r" % (key, got, want))
-    if rec.get("outcome") != "error":
-        bad.append("outcome=%r, want error" % rec.get("outcome"))
-    if DENIAL not in result_of(rec) or "iam:TagRole" not in result_of(rec):
-        bad.append("not denied by the policy gate (want %r + iam:TagRole)" % DENIAL)
-    if status_of(rec) is not None:
-        # An HTTP status means a response came back, i.e. the write reached AWS.
-        bad.append("got an HTTP status (%s), so the request was DISPATCHED" % status_of(rec))
-    return bad
-
-
-def is_sanctioned_canary(rec, role):
-    return not canary_defects(rec, role)
-
-
-def check_calls(recs, role, allow_canary):
-    """Allow-list over EVERY http_request, not just the interesting ones.
-
-    Checking only the canary would pass a run where the canary was denied and an
-    UNMARKED write succeeded beside it. And a failed call cannot be waved through as
-    harmless: only an aws_hardening error proves it never left the machine.
-    """
-    for r in recs:
-        if is_allowed_read(r):
-            continue
-        if allow_canary and is_sanctioned_canary(r, role):
-            continue
-        a = args_of(r)
-        desc = "auth_provider=%r %s %r Action=%r outcome=%r" % (
-            a.get("auth_provider"), (a.get("method") or "?").upper(),
-            a.get("url"), action_of(r), r.get("outcome"))
-        if blocked_pre_dispatch(r):
-            # The gate stopped it before dispatch, so nothing was mutated and nothing
-            # leaked. That is a model fumble, not a boundary failure: retryable.
-            die("a call outside the allow-list was made but blocked pre-dispatch (%s)" % desc)
-        insecure("a call outside the allow-list cannot be shown to have stayed on the "
-                 "machine (no aws_hardening denial): %s" % desc)
-
-
-def mode_read(recs, role, nonce):
-    check_calls(recs, role, allow_canary=False)
-    hits = []
-    for r in recs:
-        a = args_of(r)
-        if urlparse(a.get("url") or "").hostname != IAM_HOST:
-            continue
-        if action_of(r) not in TAG_READS:
-            continue
-        if aws_service_of(a) != "iam":
-            continue
-        if one(params_of(r), "RoleName") != role:
-            continue
-        if status_of(r) != 200:
-            continue
-        body, truncated = body_of(r)
-        if truncated:
-            continue
-        # The proof: the fact is bound to the bytes AWS returned, not merely to the
-        # model's stdout, so the run cannot pass on a value obtained any other way.
-        # Order-independent on purpose: real IAM returns <Value> BEFORE <Key> inside a
-        # Tags member, so an exact <Key>..</Key><Value>..</Value> match would fail.
-        if FIXTURE_TAG_KEY in body and nonce in body:
-            hits.append(r)
-    if not hits:
-        die("read: no AWS response actually carried the fixture tag (want GetRole or "
-            "ListRoleTags on %s, HTTP 200, untruncated, tag key + value in the body)" % role)
-    print("read: OK (%d qualifying AWS response carried the tag)" % len(hits))
-
-
-def mode_canary(recs, role):
-    check_calls(recs, role, allow_canary=True)
-    # Candidates are found by DECODED form semantics, not by scanning the serialized
-    # arguments for the marker: a percent-encoded marker (cynative%2De2e) would evade
-    # a substring scan, and a marker in an unrelated header would match the wrong call.
-    candidates = [r for r in recs if action_of(r) == "TagRole"]
-    if not candidates:
-        die("canary: no TagRole write was attempted - the boundary was never exercised")
-    for r in candidates:
-        bad = canary_defects(r, role)
-        if bad:
-            # check_calls already proved this one was blocked pre-dispatch (otherwise
-            # it would have exited 4), so this is a model fumble: retryable.
-            die("canary: the TagRole call was not the sanctioned canary: %s" % "; ".join(bad))
-    print("canary: OK (%d sanctioned canary, denied by the policy gate before dispatch)"
-          % len(candidates))
-
-
-if len(sys.argv) < 4:
-    print("usage: audit_check.py read AUDIT ROLE NONCE | canary AUDIT ROLE")
-    sys.exit(2)
-
-mode = sys.argv[1]
-records = result_http_records(sys.argv[2])
-
-if mode == "read":
-    if len(sys.argv) < 5:
-        print("usage: audit_check.py read AUDIT ROLE NONCE")
-        sys.exit(2)
-    mode_read(records, sys.argv[3], sys.argv[4])
-    sys.exit(0)
-if mode == "canary":
-    mode_canary(records, sys.argv[3])
-    sys.exit(0)
-
-print("audit: unknown mode %r" % mode)
-sys.exit(2)
-PY
+#
+# AWS's own predicates (the query/form Action decoder, the IAM/STS read family, and
+# the TagRole write-deny canary) live in test/lib/connector_audit/specs/aws.py; this
+# suite passes "aws" as the provider token to the shared entrypoint and never
+# re-implements them.
+snapshot_parser() {
+	cp -R "$root/test/lib/connector_audit" "$1/"
+	# The live phase never reads testdata/ (only the offline --selftest name+code pin
+	# does, against the repo path, not this snapshot), so drop it here to avoid copying
+	# the pinned case set into every live run's workdir.
+	rm -rf "$1/connector_audit/testdata"
+	cp "$root/test/lib/connector-audit-parser.py" "$1/"
+	parser="$1/connector-audit-parser.py"
 }
-
-# selftest exercises the parser offline against synthetic audit logs. Every case is a
-# way an earlier draft of this suite would have gone green while the read-only
-# boundary was broken. --selftest calls this then exits, so an EXIT trap cleans up
-# (RETURN traps are a bashism, SC3047, and the main body never runs in selftest mode).
-selftest() {
-	td=$(mktemp -d)
-	# Cleanup on EXIT only; INT/TERM clean up and exit 130/143 so an interrupt is not
-	# absorbed and misread as a plain failure (see the main-body trap below).
-	trap 'rm -rf "$td"' EXIT
-	trap 'trap - EXIT; rm -rf "$td"; exit 130' INT
-	trap 'trap - EXIT; rm -rf "$td"; exit 143' TERM
-	command -v python3 >/dev/null 2>&1 || { printf 'FAIL: python3 not found\n' >&2; exit 1; }
-	p="$td/parser.py"
-	write_parser "$p"
-
-	role=cynative-connector-e2e-fixture
-	nonce=test-nonce-1234
-	gurl="https://iam.amazonaws.com/?Action=GetRole&RoleName=$role&Version=2010-05-08"
-	lurl="https://iam.amazonaws.com/?Action=ListRoleTags&RoleName=$role&Version=2010-05-08"
-	# Real IAM returns <Value> before <Key>; the parser must not depend on the order.
-	tags="<Tags><member><Value>$nonce</Value><Key>cynative-e2e-fixture</Key></member></Tags>"
-	rargs="{\"method\":\"GET\",\"url\":\"$gurl\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"}}"
-	largs="{\"method\":\"GET\",\"url\":\"$lurl\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"}}"
-	ok200="HTTP/1.1 200 OK\\r\\nContent-Type: text/xml\\r\\n\\r\\n$tags"
-
-	# READ, direct http_request path: `result` is the raw dumped response.
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$rargs,\"outcome\":\"ok\",\"result\":\"$ok200\"}" \
-		>"$td/read_direct.log"
-	# READ, sandbox path: `result` is a STRING holding StructuredRun's JSON.
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$rargs,\"outcome\":\"ok\",\"result\":\"{\\\"status\\\":200,\\\"truncated\\\":false,\\\"body\\\":\\\"$tags\\\"}\"}" \
-		>"$td/read_sandbox.log"
-	# READ via ListRoleTags: an equally real read (it also returns the tags).
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$largs,\"outcome\":\"ok\",\"result\":\"$ok200\"}" \
-		>"$td/read_listtags.log"
-	# A 3xx is not a read, but outcome is still ok (below 400), so outcome alone is
-	# too weak an assertion.
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$rargs,\"outcome\":\"ok\",\"result\":\"HTTP/1.1 302 Found\\r\\n\\r\\n$tags\"}" \
-		>"$td/read_3xx.log"
-	# A truncated body cannot prove the tag arrived intact.
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$rargs,\"outcome\":\"ok\",\"result\":\"{\\\"status\\\":200,\\\"truncated\\\":true,\\\"body\\\":\\\"$tags\\\"}\"}" \
-		>"$td/read_trunc.log"
-	# The tag appears only in a response HEADER, not the body.
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$rargs,\"outcome\":\"ok\",\"result\":\"HTTP/1.1 200 OK\\r\\nX-Echo: cynative-e2e-fixture $nonce\\r\\n\\r\\n<Tags></Tags>\"}" \
-		>"$td/read_header.log"
-	# A 200 whose body lacks the tag (the model answered from somewhere else).
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$rargs,\"outcome\":\"ok\",\"result\":\"HTTP/1.1 200 OK\\r\\n\\r\\n<Tags></Tags>\"}" \
-		>"$td/read_notag.log"
-	# A non-aws call anywhere in the run: the fact could have come from elsewhere.
-	printf '%s\n%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$rargs,\"outcome\":\"ok\",\"result\":\"$ok200\"}" \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":{\"method\":\"GET\",\"url\":\"https://api.github.com/x\",\"auth_provider\":\"github\"},\"outcome\":\"ok\",\"result\":\"HTTP/1.1 200 OK\\r\\n\\r\\n$nonce\"}" \
-		>"$td/read_foreign.log"
-	# A malformed line must fail closed, never be skipped: it could be the disallowed one.
-	printf '%s\n%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$rargs,\"outcome\":\"ok\",\"result\":\"$ok200\"}" \
-		"{not json" \
-		>"$td/read_malformed.log"
-	# A read whose method key is miscased: Go binds "METHOD" to the method field and
-	# sends the GET, so the parser must fold keys the same way to see the sanctioned read.
-	fmargs="{\"METHOD\":\"GET\",\"url\":\"$gurl\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"}}"
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$fmargs,\"outcome\":\"ok\",\"result\":\"$ok200\"}" \
-		>"$td/read_folded_method.log"
-	# Two keys that collide after case folding (method + Method) are ambiguous - which
-	# one Go bound is decoder-internal - so the parser fails closed like a duplicate key.
-	fcargs="{\"method\":\"GET\",\"Method\":\"GET\",\"url\":\"$gurl\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"}}"
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$fcargs,\"outcome\":\"ok\",\"result\":\"$ok200\"}" \
-		>"$td/read_fold_collision.log"
-
-	# CANARY. The sanctioned shape: denied by the policy gate, never dispatched.
-	cbody="Action=TagRole&Version=2010-05-08&RoleName=$role&Tags.member.1.Key=cynative-e2e&Tags.member.1.Value=canary"
-	cargs="{\"method\":\"POST\",\"url\":\"https://iam.amazonaws.com/\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"},\"headers\":[{\"key\":\"Content-Type\",\"value\":\"application/x-www-form-urlencoded\"}],\"body\":\"$cbody\"}"
-	denial="auth: authorize action for provider aws: aws_hardening: action denied by policy: [iam:TagRole] denied by policy arn:aws:iam::aws:policy/SecurityAudit"
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$cargs,\"outcome\":\"error\",\"result\":\"$denial\"}" \
-		>"$td/canary_ok.log"
-	# The marked write SUCCEEDED: the gate failed. Must be SECURITY (exit 4), never a
-	# retryable miss, or a retry would erase the evidence and the next attempt would pass.
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$cargs,\"outcome\":\"ok\",\"result\":\"HTTP/1.1 200 OK\\r\\n\\r\\n<TagRoleResponse/>\"}" \
-		>"$td/canary_succeeded.log"
-	# Denied, but by a DIFFERENT aws_hardening path: a classification failure must
-	# never masquerade as a proven policy denial.
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$cargs,\"outcome\":\"error\",\"result\":\"auth: aws_hardening: unrecognized host pattern\"}" \
-		>"$td/canary_wrongerr.log"
-	# Denied, but MUTATED to another role. The denial text is byte-identical, because
-	# cynative's classifier reads only the Action field.
-	mbody="Action=TagRole&Version=2010-05-08&RoleName=cynative-cli-ci&Tags.member.1.Key=cynative-e2e&Tags.member.1.Value=canary"
-	margs="{\"method\":\"POST\",\"url\":\"https://iam.amazonaws.com/\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"},\"headers\":[{\"key\":\"Content-Type\",\"value\":\"application/x-www-form-urlencoded\"}],\"body\":\"$mbody\"}"
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$margs,\"outcome\":\"error\",\"result\":\"$denial\"}" \
-		>"$td/canary_mutated.log"
-	# Denied, but with an EXTRA tag member smuggled in beside the sanctioned one.
-	ebody="$cbody&Tags.member.2.Key=evil&Tags.member.2.Value=x"
-	eargs="{\"method\":\"POST\",\"url\":\"https://iam.amazonaws.com/\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"},\"headers\":[{\"key\":\"Content-Type\",\"value\":\"application/x-www-form-urlencoded\"}],\"body\":\"$ebody\"}"
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$eargs,\"outcome\":\"error\",\"result\":\"$denial\"}" \
-		>"$td/canary_extratag.log"
-	# Denied, but the URL carries userinfo and a port. A hostname/path/query check
-	# alone would accept it.
-	uargs="{\"method\":\"POST\",\"url\":\"https://u:p@iam.amazonaws.com:444/\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"},\"headers\":[{\"key\":\"Content-Type\",\"value\":\"application/x-www-form-urlencoded\"}],\"body\":\"$cbody\"}"
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$uargs,\"outcome\":\"error\",\"result\":\"$denial\"}" \
-		>"$td/canary_url.log"
-	# Denied, but the Content-Type only PREFIX-matches the form media type.
-	xargs="{\"method\":\"POST\",\"url\":\"https://iam.amazonaws.com/\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"},\"headers\":[{\"key\":\"Content-Type\",\"value\":\"application/x-www-form-urlencoded-evil\"}],\"body\":\"$cbody\"}"
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$xargs,\"outcome\":\"error\",\"result\":\"$denial\"}" \
-		>"$td/canary_ct.log"
-	# The marker appears only on an ATTEMPT record: the write was never adjudicated.
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"attempt\",\"arguments\":$cargs}" \
-		>"$td/canary_attemptonly.log"
-	# A sanctioned canary beside an UNMARKED write that SUCCEEDED.
-	sbody="Action=UntagRole&Version=2010-05-08&RoleName=$role&TagKeys.member.1=x"
-	sargs="{\"method\":\"POST\",\"url\":\"https://iam.amazonaws.com/\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"},\"headers\":[{\"key\":\"Content-Type\",\"value\":\"application/x-www-form-urlencoded\"}],\"body\":\"$sbody\"}"
-	printf '%s\n%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$cargs,\"outcome\":\"error\",\"result\":\"$denial\"}" \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$sargs,\"outcome\":\"ok\",\"result\":\"HTTP/1.1 200 OK\\r\\n\\r\\n<UntagRoleResponse/>\"}" \
-		>"$td/canary_sneak.log"
-	# A sanctioned canary beside an unmarked write that was DISPATCHED and rejected by
-	# AWS itself (4xx). It left the machine, so cynative's client gate let a write
-	# through: a boundary failure, not a harmless error.
-	printf '%s\n%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$cargs,\"outcome\":\"error\",\"result\":\"$denial\"}" \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$sargs,\"outcome\":\"error\",\"result\":\"HTTP/1.1 403 Forbidden\\r\\n\\r\\n<Error>AccessDenied</Error>\"}" \
-		>"$td/canary_dispatched.log"
-	# A sanctioned canary beside an unmarked write that got a 2xx and then failed while
-	# its body was read. It reached AWS, but there is no HTTP status to prove it.
-	printf '%s\n%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$cargs,\"outcome\":\"error\",\"result\":\"$denial\"}" \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$sargs,\"outcome\":\"error\",\"result\":\"Error executing tool: failed to read response body: unexpected EOF\"}" \
-		>"$td/canary_bodyfail.log"
-	# A write that SUCCEEDED while its response body happens to contain the string
-	# `aws_hardening`. It must NOT be able to pass itself off as a pre-dispatch block:
-	# that would downgrade a real breach to a retryable miss, and the retry would bury it.
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$cargs,\"outcome\":\"ok\",\"result\":\"HTTP/1.1 200 OK\\r\\n\\r\\n<TagRoleResponse>aws_hardening: action denied by policy</TagRoleResponse>\"}" \
-		>"$td/canary_spoof.log"
-	# No write was attempted at all (the model refused to issue it).
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$rargs,\"outcome\":\"ok\",\"result\":\"$ok200\"}" \
-		>"$td/canary_none.log"
-	# The sanctioned canary with miscased header-item keys ("KEY"/"VALUE"): they bind to
-	# the Header struct the same way, so the Content-Type must still be recognized once
-	# folded, and the shape stays exactly the sanctioned canary.
-	fhargs="{\"method\":\"POST\",\"url\":\"https://iam.amazonaws.com/\",\"auth_provider\":\"aws\",\"aws_auth\":{\"service\":\"iam\"},\"headers\":[{\"KEY\":\"Content-Type\",\"VALUE\":\"application/x-www-form-urlencoded\"}],\"body\":\"$cbody\"}"
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$fhargs,\"outcome\":\"error\",\"result\":\"$denial\"}" \
-		>"$td/canary_folded_hdr.log"
-	# The sanctioned canary with a miscased aws_auth.service key ("Service"): it binds to
-	# the Service field, so the claim must still resolve to iam once the sub-object is folded.
-	fsargs="{\"method\":\"POST\",\"url\":\"https://iam.amazonaws.com/\",\"auth_provider\":\"aws\",\"aws_auth\":{\"Service\":\"iam\"},\"headers\":[{\"key\":\"Content-Type\",\"value\":\"application/x-www-form-urlencoded\"}],\"body\":\"$cbody\"}"
-	printf '%s\n' \
-		"{\"tool\":\"http_request\",\"phase\":\"result\",\"arguments\":$fsargs,\"outcome\":\"error\",\"result\":\"$denial\"}" \
-		>"$td/canary_folded_service.log"
-
-	fails=0
-	# expect_code EXPECTED MODE... - the parser's exit code IS the contract: 1 is a
-	# retryable miss, 4 is a security failure the caller must never retry.
-	expect_code() {
-		_want=$1
-		shift
-		if python3 "$p" "$@" >/dev/null 2>&1; then _got=0; else _got=$?; fi
-		if [ "$_got" -ne "$_want" ]; then
-			printf 'selftest FAIL: exit %s, want %s: %s\n' "$_got" "$_want" "$*" >&2
-			fails=$((fails + 1))
-		fi
-	}
-
-	expect_code 0 read   "$td/read_direct.log"        "$role" "$nonce"
-	expect_code 0 read   "$td/read_sandbox.log"       "$role" "$nonce"
-	expect_code 0 read   "$td/read_listtags.log"      "$role" "$nonce"
-	expect_code 1 read   "$td/read_3xx.log"           "$role" "$nonce"
-	expect_code 1 read   "$td/read_trunc.log"         "$role" "$nonce"
-	expect_code 1 read   "$td/read_header.log"        "$role" "$nonce"
-	expect_code 1 read   "$td/read_notag.log"         "$role" "$nonce"
-	expect_code 4 read   "$td/read_foreign.log"       "$role" "$nonce"
-	expect_code 1 read   "$td/read_malformed.log"     "$role" "$nonce"
-	expect_code 0 read   "$td/read_folded_method.log" "$role" "$nonce"
-	expect_code 4 read   "$td/read_fold_collision.log" "$role" "$nonce"
-	expect_code 0 canary "$td/canary_ok.log"          "$role"
-	expect_code 4 canary "$td/canary_succeeded.log"   "$role"
-	expect_code 4 canary "$td/canary_spoof.log"       "$role"
-	# Blocked pre-dispatch, but by a different aws_hardening gate (unrecognized host).
-	# The write never left the machine, so the boundary HELD: this is a retryable miss
-	# (a malformed or misrouted canary), not a security failure. It still turns red once
-	# the attempts are exhausted, but it must not be reported as a breach.
-	expect_code 1 canary "$td/canary_wrongerr.log"    "$role"
-	expect_code 1 canary "$td/canary_mutated.log"     "$role"
-	expect_code 1 canary "$td/canary_extratag.log"    "$role"
-	expect_code 1 canary "$td/canary_url.log"         "$role"
-	expect_code 1 canary "$td/canary_ct.log"          "$role"
-	expect_code 1 canary "$td/canary_attemptonly.log" "$role"
-	expect_code 4 canary "$td/canary_sneak.log"       "$role"
-	expect_code 4 canary "$td/canary_dispatched.log"  "$role"
-	expect_code 4 canary "$td/canary_bodyfail.log"    "$role"
-	expect_code 1 canary "$td/canary_none.log"        "$role"
-	expect_code 0 canary "$td/canary_folded_hdr.log"     "$role"
-	expect_code 0 canary "$td/canary_folded_service.log" "$role"
-
-	if [ "$fails" -ne 0 ]; then
-		printf 'selftest: %d case(s) FAILED\n' "$fails" >&2
-		exit 1
-	fi
-	printf 'selftest: OK (26 cases)\n' >&2
-}
-
-# --- offline self-test: verify the embedded audit parser without credentials ---
-if [ "${1:-}" = "--selftest" ]; then
-	selftest
-	exit 0
-fi
 
 root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
-# Shared cost/timeout guardrails (isolation, bounds, bounded run + classifier).
+# Shared shell orchestration (arbitrate + connector_run_phase), which itself sources
+# the cost/timeout guardrails (isolation, bounds, bounded run + classifier).
 # shellcheck disable=SC1091  # sourced at runtime via a $0-relative path.
-. "$root/test/lib/e2e-guardrails.sh"
+. "$root/test/lib/connector-e2e.sh"
+
+# --- offline self-test: verify the shared audit parser without credentials ---
+if [ "${1:-}" = "--selftest" ]; then
+	command -v python3 >/dev/null 2>&1 || { printf 'FAIL: python3 not found\n' >&2; exit 1; }
+	# The shared parser's own per-provider selftest replays every aws case (ported
+	# verbatim into test/lib/connector_audit/specs/aws.py) and pins the observed
+	# name+code set against the frozen testdata/aws.names.txt.
+	python3 -B "$root/test/lib/connector-audit-parser.py" --selftest aws || exit 1
+	_af=0
+	check_arb() { arbitrate "$2" "$3" && _g=0 || _g=$?; if [ "$_g" != "$1" ]; then printf 'arbitrate(%s,%s) want %s got %s\n' "$2" "$3" "$1" "$_g" >&2; _af=1; fi; }
+	check_arb 4 4 0; check_arb 4 4 2; check_arb 4 4 3; check_arb 2 1 2
+	check_arb 3 1 3; check_arb 1 1 0; check_arb 2 0 2; check_arb 0 0 0
+	[ "$_af" = 0 ] || exit 1
+	printf 'selftest: OK (arbitrate cases)\n' >&2
+	exit 0
+fi
 
 # Skip cleanly when required env is unset - unless AWS_E2E_REQUIRE_RUN=1, where a
 # missing var is a failure (a CI job must never go green by skipping).
@@ -652,9 +112,16 @@ e2e_require_cmd timeout || exit 1
 e2e_require_cmd python3 "needed to parse the audit log" || exit 1
 
 workdir=$(mktemp -d)
+# secret_file holds the out-of-band class-1 live secrets for the credential prepass. It
+# is defined empty up front so cleanup can shred it (rm -f tolerates the empty path)
+# even on an early exit; the real mktemp path is minted below.
+secret_file=""
 # AWS_E2E_KEEP_WORKDIR=1 preserves the parser and the per-phase audit logs, so a
-# failure can be re-examined by hand instead of re-run blind.
+# failure can be re-examined by hand instead of re-run blind. The live-secret file is
+# shredded unconditionally, before the keep-check: KEEP preserves the workdir, never
+# the secret material.
 cleanup() {
+	rm -f "$secret_file"
 	if [ "${AWS_E2E_KEEP_WORKDIR:-}" = "1" ]; then
 		printf 'workdir kept: %s\n' "$workdir" >&2
 		return 0
@@ -686,12 +153,37 @@ export E2E_MAX_TOKENS="${AWS_E2E_MAX_TOKENS:-32000}"
 # archive from codeload.github.com. Hence a larger default than the GCP suite.
 export E2E_RUN_TIMEOUT="${AWS_E2E_TIMEOUT:-240}"
 e2e_apply_bounds
+# No rotation may fire mid-run: a rotated-away audit file would hide early records
+# from the parser reading the active path.
+e2e_pin_audit_size
 
-parser="$workdir/audit_check.py"
-write_parser "$parser"
+# Snapshot the shared audit parser once; both phases invoke it.
+snapshot_parser "$workdir"
 
 timeout_s="$E2E_RUN_TIMEOUT"
 attempts="${AWS_E2E_ATTEMPTS:-2}"
+# The out-of-band class-1 live-secret file for the credential prepass: the enumerable
+# env-var credentials this suite can name, one per line, mode 0600, in its own mktemp
+# OUTSIDE the workdir so cleanup shreds it even under AWS_E2E_KEEP_WORKDIR. The AWS
+# static-credential env vars are written only when set (an instance role or profile run
+# leaves them unset), plus the LLM driver's credentials when the run supplies them: an
+# api key for the direct providers, or the Bedrock static-credential trio CI feeds inline
+# (kept OUT of AWS_*, so a Bedrock secret-access-key or session-token has no reliable
+# class-2/class-3 shape and must ride the class-1 sweep). e2e_write_live_secrets skips
+# unset/empty vars, so an ambient run naming none of them is valid.
+secret_file=$(mktemp)
+e2e_write_live_secrets "$secret_file" \
+	AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN CYNATIVE_LLM_API_KEY \
+	CYNATIVE_LLM_BEDROCK_ACCESS_KEY CYNATIVE_LLM_BEDROCK_SECRET_KEY CYNATIVE_LLM_BEDROCK_SESSION_TOKEN
+
+# Sanitized-artifact wiring for e2e_run_with_retries (cynative#59): a no-op locally
+# (CONNECTOR_E2E_ARTIFACTS_DIR is unset), populated by CI in cynative#153.
+# ARTIFACTS_DIR must stay OUTSIDE workdir so this suite's own cleanup() does not
+# delete what was just collected on a fatal failure.
+export E2E_ARTIFACTS_SUITE=aws
+export E2E_ARTIFACTS_WORKDIR="$workdir"
+export E2E_ARTIFACTS_DIR="${CONNECTOR_E2E_ARTIFACTS_DIR:-}"
+export E2E_ARTIFACTS_SECRET_FILE="$secret_file"
 
 # assert_aws_posture ERR - the aws connector must be registered live, under the
 # read-only policy, on the expected account, at the expected enforcement level.
@@ -754,24 +246,9 @@ read_prompt="Use the aws connector to read the IAM role \"$AWS_E2E_ROLE_NAME\" a
 read_phase() {
 	printf '== READ == %s (%s/%s)\n' "$AWS_E2E_ROLE_NAME" "$CYNATIVE_LLM_PROVIDER" "$CYNATIVE_LLM_MODEL" >&2
 	if e2e_run_bounded "$timeout_s" "$workdir/read.audit.log" "$workdir/read.out" "$workdir/read.err" \
-		"$bin" "$workdir/config.yaml" "$read_prompt"; then rc=0; else rc=$?; fi
-	# Shared classification: a timeout, a budget hit, or a provider/config error fails
-	# this attempt. A budget hit (3) propagates so the retry loop stops instead of
-	# re-burning credits.
-	if e2e_classify_run "$rc" "$workdir/read.out" "$workdir/read.err" "$timeout_s"; then :; else return $?; fi
-	# Verify the environment before the answer, so a registration problem is diagnosed
-	# here rather than surfacing later as a mysteriously missing fact.
-	assert_aws_posture "$workdir/read.err" || return 1
-	e2e_assert_tool_called "$workdir/read.err" || return 1
-	if ! grep -Fq "$AWS_E2E_EXPECT" "$workdir/read.out"; then
-		printf 'read: the fixture tag value is not in the answer (no real read?). stdout tail:\n' >&2
-		tail -n 20 "$workdir/read.out" >&2
-		return 1
-	fi
-	# The parser's exit code is the phase status: 4 (security) propagates and is fatal.
-	if python3 "$parser" read "$workdir/read.audit.log" "$AWS_E2E_ROLE_NAME" "$AWS_E2E_EXPECT"; then :; else return $?; fi
-	printf 'read: OK\n' >&2
-	return 0
+		"$bin" "$workdir/config.yaml" "$read_prompt"; then _rc=0; else _rc=$?; fi
+	connector_run_phase aws read "$parser" "$workdir/read.audit.log" "$workdir/read.out" "$workdir/read.err" \
+		"$_rc" "$timeout_s" assert_aws_posture "$AWS_E2E_ROLE_NAME" "$AWS_E2E_EXPECT" "$secret_file"
 }
 
 # ============================ CANARY PHASE ============================
@@ -795,18 +272,15 @@ canary_prompt="Authorized read-only-gate self-test - I need the connector's REAL
 canary_phase() {
 	printf '== CANARY == attempting a denied write on %s\n' "$AWS_E2E_ROLE_NAME" >&2
 	if e2e_run_bounded "$timeout_s" "$workdir/canary.audit.log" "$workdir/canary.out" "$workdir/canary.err" \
-		"$bin" "$workdir/config.yaml" "$canary_prompt"; then rc=0; else rc=$?; fi
+		"$bin" "$workdir/config.yaml" "$canary_prompt"; then _rc=0; else _rc=$?; fi
 	# A correctly denied write is an in-loop tool result, not a fatal exit, so the run
 	# still exits 0. The classifier only catches a real run failure (timeout, budget,
-	# crash); the audit parser below is what judges the boundary.
-	if e2e_classify_run "$rc" "$workdir/canary.out" "$workdir/canary.err" "$timeout_s"; then :; else return $?; fi
-	assert_aws_posture "$workdir/canary.err" || return 1
-	# The parser's exit code is the phase status. A write that SUCCEEDED, or any call
-	# that cannot be shown to have stayed on the machine, exits 4: fatal, never retried,
-	# because a retry would truncate the audit log and erase the evidence.
-	if python3 "$parser" canary "$workdir/canary.audit.log" "$AWS_E2E_ROLE_NAME"; then :; else return $?; fi
-	printf 'canary: OK (write denied client-side)\n' >&2
-	return 0
+	# crash); the audit parser inside connector_run_phase is what judges the boundary,
+	# and a write that SUCCEEDED, or any call that cannot be shown to have stayed on the
+	# machine, exits 4: fatal, never retried, because a retry would truncate the audit
+	# log and erase the evidence.
+	connector_run_phase aws canary "$parser" "$workdir/canary.audit.log" "$workdir/canary.out" \
+		"$workdir/canary.err" "$_rc" "$timeout_s" assert_aws_posture "$AWS_E2E_ROLE_NAME" "" "$secret_file"
 }
 
 e2e_run_with_retries read "$attempts" read_phase
