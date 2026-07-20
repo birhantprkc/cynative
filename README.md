@@ -180,6 +180,52 @@ Cynative calls your stack using the credentials already in your shell - it keeps
 Cynative prints a short operational footer (timing, token usage) to **stderr** - redirecting stdout (`cynative -p "..." > out.txt`) keeps the captured answer clean. `--version` prints version, commit, build date, Go version, and platform.
 
 <details>
+<summary><strong>Shell completions</strong></summary>
+
+Generate a completion script (no config or credentials required):
+
+```bash
+# current session
+source <(cynative completion bash)   # bash
+# zsh needs compinit before the script's compdef calls (skip if already enabled)
+autoload -U compinit && compinit
+source <(cynative completion zsh)
+cynative completion fish | source    # fish
+```
+
+```powershell
+# current session (PowerShell)
+cynative completion powershell | Out-String | Invoke-Expression
+```
+
+Install for every new session (examples):
+
+```bash
+# bash (Linux)
+cynative completion bash > /etc/bash_completion.d/cynative
+# bash (macOS Homebrew)
+cynative completion bash > "$(brew --prefix)/etc/bash_completion.d/cynative"
+
+# zsh (Linux) — also ensure compinit is enabled in ~/.zshrc if needed:
+#   echo "autoload -U compinit; compinit" >> ~/.zshrc
+cynative completion zsh > "${fpath[1]}/_cynative"
+# zsh (macOS Homebrew)
+cynative completion zsh > "$(brew --prefix)/share/zsh/site-functions/_cynative"
+
+# fish
+cynative completion fish > ~/.config/fish/completions/cynative.fish
+```
+
+```powershell
+# PowerShell — append to your profile so every new session loads completions:
+#   if (!(Test-Path $PROFILE)) { New-Item -Path $PROFILE -Type File -Force }
+Add-Content -Path $PROFILE -Value 'cynative completion powershell | Out-String | Invoke-Expression'
+```
+
+See `cynative completion <shell> --help` for the full install notes for each shell.
+</details>
+
+<details>
 <summary><strong>Resource &amp; cost controls for unattended runs</strong></summary>
 
 **Resource & cost controls:** for unattended, scheduled or long-horizon runs - wired into cron, CI or any trigger - bound the work explicitly. The key knobs (config keys / env vars):
