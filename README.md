@@ -1,11 +1,6 @@
-<h1>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png">
-    <img src="docs/assets/logo.png" alt="cynative" width="300">
-  </picture>
-  <br>
-  Deep research for your infrastructure
-</h1>
+<p align="left"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.png"><img src="docs/assets/logo.png" alt="cynative" width="350"></picture></p>
+
+# Deep research for your infrastructure
 
 [![CI](https://github.com/cynative/cynative/actions/workflows/ci.yaml/badge.svg)](https://github.com/cynative/cynative/actions/workflows/ci.yaml)
 [![Release](https://img.shields.io/github/v/release/cynative/cynative)](https://github.com/cynative/cynative/releases/latest)
@@ -304,6 +299,10 @@ Configure under `audit:` in `~/.cynative/config.yaml`, or via env:
 | `audit.max_size_mb` | `CYNATIVE_AUDIT_MAX_SIZE_MB` | `100` |
 | `audit.retention_days` | `CYNATIVE_AUDIT_RETENTION_DAYS` | `30` |
 | `audit.compress` | `CYNATIVE_AUDIT_COMPRESS` | `false` |
+
+## Questions and feedback
+
+[Discussions](https://github.com/cynative/cynative/discussions) is the best place to share your feedback - what you pointed it at, what came back, and what's missing.
 
 ## Contributing
 
