@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -241,7 +242,7 @@ func TestDoctor_Help(t *testing.T) {
 	}
 
 	out := buf.String()
-	for _, want := range []string{"Validate configuration", "connector", "verbose", "live read-only"} {
+	for _, want := range []string{"Validate configuration", "connector", "verbose", "live-llm", "live read-only"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("doctor help missing %q; got:\n%s", want, out)
 		}
@@ -265,6 +266,290 @@ func TestDoctor_DoesNotCallChatModel(t *testing.T) {
 	}
 	if called {
 		t.Fatal("doctor must not construct a chat model")
+	}
+}
+
+func TestDoctor_LiveLLM_OK(t *testing.T) {
+	t.Parallel()
+
+	const nonce = "DOCTOR-TESTNONCE"
+
+	u := &fakeUI{} //nolint:exhaustruct // recorders zero.
+	d := testDeps()
+	d.ui = u
+	d.newDoctorProbeNonce = func() string { return nonce }
+	d.newChatModel = func(context.Context, config.Config, func(schema.Usage)) (chatModel, error) {
+		return &fakeChatModel{ //nolint:exhaustruct // errs/calls not pre-set
+			responses: []*schema.Message{schema.AssistantMessage(nonce, nil)},
+		}, nil
+	}
+
+	var errBuf bytes.Buffer
+
+	d.errOut = &errBuf
+
+	_, err := runWithArgs(t, d, []string{"doctor", "--live-llm"})
+	if err != nil {
+		t.Fatalf("doctor --live-llm: %v", err)
+	}
+	if len(u.llmStatuses) != 1 || u.llmStatuses[0].State != ui.ConnectorOK {
+		t.Errorf("llmStatuses = %+v, want one OK status", u.llmStatuses)
+	}
+	if got := u.llmStatuses[0].Reason; got != "configuration valid; connectivity verified" {
+		t.Errorf("LLM Reason = %q, want connectivity-verified wording", got)
+	}
+	if !strings.Contains(errBuf.String(), "Doctor: ready") {
+		t.Errorf("stderr missing Doctor: ready; got %q", errBuf.String())
+	}
+}
+
+func TestDoctor_LiveLLM_CaseInsensitiveNonce(t *testing.T) {
+	t.Parallel()
+
+	const nonce = "DOCTOR-AbCdEf"
+
+	u := &fakeUI{} //nolint:exhaustruct // recorders zero.
+	d := testDeps()
+	d.ui = u
+	d.newDoctorProbeNonce = func() string { return nonce }
+	d.newChatModel = func(context.Context, config.Config, func(schema.Usage)) (chatModel, error) {
+		return &fakeChatModel{ //nolint:exhaustruct // errs unused
+			responses: []*schema.Message{schema.AssistantMessage(strings.ToLower(nonce), nil)},
+		}, nil
+	}
+
+	_, err := runWithArgs(t, d, []string{"doctor", "--live-llm"})
+	if err != nil {
+		t.Fatalf("doctor --live-llm with case-folded echo: %v", err)
+	}
+	if len(u.llmStatuses) != 1 || u.llmStatuses[0].State != ui.ConnectorOK {
+		t.Errorf("llmStatuses = %+v, want one OK status", u.llmStatuses)
+	}
+}
+
+func TestDoctor_LiveLLM_InitFailure(t *testing.T) {
+	t.Parallel()
+
+	u := &fakeUI{} //nolint:exhaustruct // recorders zero.
+	d := testDeps()
+	d.ui = u
+	d.newChatModel = func(context.Context, config.Config, func(schema.Usage)) (chatModel, error) {
+		return nil, errors.New("bifrost init failed")
+	}
+
+	_, err := runWithArgs(t, d, []string{"doctor", "--live-llm"})
+	if !errors.Is(err, ErrLLMUnavailable) {
+		t.Fatalf("err = %v, want ErrLLMUnavailable", err)
+	}
+	if len(u.llmStatuses) != 1 || u.llmStatuses[0].State != ui.ConnectorError {
+		t.Errorf("llmStatuses = %+v, want one Error status", u.llmStatuses)
+	}
+	if ExitCodeFor(err) != 1 {
+		t.Errorf("ExitCodeFor = %d, want 1", ExitCodeFor(err))
+	}
+}
+
+func TestDoctor_LiveLLM_GenerateFailure(t *testing.T) {
+	t.Parallel()
+
+	u := &fakeUI{} //nolint:exhaustruct // recorders zero.
+	d := testDeps()
+	d.ui = u
+	d.newDoctorProbeNonce = func() string { return "DOCTOR-TESTNONCE" }
+	d.newChatModel = func(context.Context, config.Config, func(schema.Usage)) (chatModel, error) {
+		return &fakeChatModel{ //nolint:exhaustruct // responses unused
+			errs: []error{errors.New("provider down")},
+		}, nil
+	}
+
+	_, err := runWithArgs(t, d, []string{"doctor", "--live-llm"})
+	if !errors.Is(err, ErrLLMUnavailable) {
+		t.Fatalf("err = %v, want ErrLLMUnavailable", err)
+	}
+	if len(u.llmStatuses) != 1 || u.llmStatuses[0].State != ui.ConnectorError {
+		t.Errorf("llmStatuses = %+v, want one Error status", u.llmStatuses)
+	}
+}
+
+func TestDoctor_LiveLLM_VerbosePrintsDetails(t *testing.T) {
+	t.Parallel()
+
+	u := &fakeUI{} //nolint:exhaustruct // recorders zero.
+	d := testDeps()
+	d.ui = u
+	d.newDoctorProbeNonce = func() string { return "DOCTOR-TESTNONCE" }
+	d.newChatModel = func(context.Context, config.Config, func(schema.Usage)) (chatModel, error) {
+		return &fakeChatModel{ //nolint:exhaustruct // responses unused
+			errs: []error{errors.New("upstream timeout from gateway")},
+		}, nil
+	}
+
+	var errBuf bytes.Buffer
+
+	d.errOut = &errBuf
+
+	_, err := runWithArgs(t, d, []string{"doctor", "--live-llm", "-v"})
+	if !errors.Is(err, ErrLLMUnavailable) {
+		t.Fatalf("err = %v, want ErrLLMUnavailable", err)
+	}
+	if !strings.Contains(errBuf.String(), "details: upstream timeout from gateway") {
+		t.Errorf("stderr missing verbose details; got %q", errBuf.String())
+	}
+}
+
+func TestDoctor_LiveLLM_InitFailureVerbosePrintsDetails(t *testing.T) {
+	t.Parallel()
+
+	const leak = "sk-ABCDEFGHIJ0123456789abcd"
+	d := testDeps()
+	d.newChatModel = func(context.Context, config.Config, func(schema.Usage)) (chatModel, error) {
+		return nil, errors.New("bifrost init failed: Incorrect API key: " + leak)
+	}
+
+	var errBuf bytes.Buffer
+
+	d.errOut = &errBuf
+
+	_, err := runWithArgs(t, d, []string{"doctor", "--live-llm", "-v"})
+	if !errors.Is(err, ErrLLMUnavailable) {
+		t.Fatalf("err = %v, want ErrLLMUnavailable", err)
+	}
+	out := errBuf.String()
+	if !strings.Contains(out, "details:") {
+		t.Errorf("stderr missing verbose details; got %q", out)
+	}
+	if strings.Contains(out, leak) {
+		t.Errorf("verbose details must redact credential-shaped text; got %q", out)
+	}
+	if !strings.Contains(out, "[REDACTED:llm-api-key]") {
+		t.Errorf("verbose details missing llm-api-key redaction; got %q", out)
+	}
+}
+
+func TestDoctorLiveProbeConfig(t *testing.T) {
+	t.Parallel()
+
+	cfg := validCfg()
+	cfg.LLM.NetworkConfig.MaxRetries = 3
+	cfg.LLM.NetworkConfig.DefaultRequestTimeoutInSeconds = 300
+
+	got := doctorLiveProbeConfig(cfg, 30*time.Second)
+	if got.LLM.NetworkConfig.MaxRetries != 0 {
+		t.Errorf("MaxRetries = %d, want 0", got.LLM.NetworkConfig.MaxRetries)
+	}
+	if got.LLM.NetworkConfig.DefaultRequestTimeoutInSeconds != 30 {
+		t.Errorf("timeout = %d, want 30", got.LLM.NetworkConfig.DefaultRequestTimeoutInSeconds)
+	}
+	if cfg.LLM.NetworkConfig.MaxRetries != 3 {
+		t.Error("doctorLiveProbeConfig must not mutate the caller's config")
+	}
+
+	tiny := doctorLiveProbeConfig(cfg, time.Millisecond)
+	if tiny.LLM.NetworkConfig.DefaultRequestTimeoutInSeconds != 1 {
+		t.Errorf("sub-second timeout must clamp to 1s, got %d",
+			tiny.LLM.NetworkConfig.DefaultRequestTimeoutInSeconds)
+	}
+}
+
+func TestDoctor_LiveLLM_NonceMismatch(t *testing.T) {
+	t.Parallel()
+
+	u := &fakeUI{} //nolint:exhaustruct // recorders zero.
+	d := testDeps()
+	d.ui = u
+	d.newDoctorProbeNonce = func() string { return "DOCTOR-EXPECTED" }
+	d.newChatModel = func(context.Context, config.Config, func(schema.Usage)) (chatModel, error) {
+		return &fakeChatModel{ //nolint:exhaustruct // errs unused
+			responses: []*schema.Message{schema.AssistantMessage("unrelated answer", nil)},
+		}, nil
+	}
+
+	_, err := runWithArgs(t, d, []string{"doctor", "--live-llm"})
+	if !errors.Is(err, ErrLLMUnavailable) {
+		t.Fatalf("err = %v, want ErrLLMUnavailable", err)
+	}
+	if len(u.llmStatuses) != 1 || u.llmStatuses[0].Reason != "live probe response mismatch" {
+		t.Errorf("llmStatuses = %+v, want mismatch reason", u.llmStatuses)
+	}
+}
+
+func TestDoctor_LiveLLM_SkippedWhenValidateLLMFails(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	d := testDeps()
+	d.loadConfig = func(string) (config.Config, error) {
+		return config.Config{}, nil //nolint:exhaustruct // empty LLM triggers ValidateLLM
+	}
+	d.newChatModel = func(context.Context, config.Config, func(schema.Usage)) (chatModel, error) {
+		called = true
+
+		return nil, errors.New("must not construct")
+	}
+
+	_, err := runWithArgs(t, d, []string{"doctor", "--live-llm"})
+	if !errors.Is(err, ErrLLMUnavailable) {
+		t.Fatalf("err = %v, want ErrLLMUnavailable", err)
+	}
+	if called {
+		t.Fatal("--live-llm must not probe before ValidateLLM passes")
+	}
+}
+
+func TestDoctor_LiveLLM_BoundsProbeContext(t *testing.T) {
+	t.Parallel()
+
+	d := testDeps()
+	var remaining time.Duration
+	var hadDeadline bool
+	gotRetries := -1
+	var gotTimeout int
+	d.newChatModel = func(ctx context.Context, cfg config.Config, _ func(schema.Usage)) (chatModel, error) {
+		if dl, ok := ctx.Deadline(); ok {
+			hadDeadline = true
+			remaining = time.Until(dl)
+		}
+		gotRetries = cfg.LLM.NetworkConfig.MaxRetries
+		gotTimeout = cfg.LLM.NetworkConfig.DefaultRequestTimeoutInSeconds
+
+		return &fakeChatModel{ //nolint:exhaustruct // errs unused
+			responses: []*schema.Message{schema.AssistantMessage("DOCTOR-TEST-DEFAULT", nil)},
+		}, nil
+	}
+
+	_, err := runWithArgs(t, d, []string{"doctor", "--live-llm"})
+	if err != nil {
+		t.Fatalf("doctor --live-llm: %v", err)
+	}
+	// Pin the production const (~30s): a wrong default would hang diagnostics.
+	if !hadDeadline || remaining <= 29*time.Second || remaining > 30*time.Second {
+		t.Fatalf("hadDeadline=%v remaining=%v, want in (29s, 30s]", hadDeadline, remaining)
+	}
+	if gotRetries != 0 {
+		t.Errorf("MaxRetries = %d, want 0 for the live probe", gotRetries)
+	}
+	if gotTimeout != 30 {
+		t.Errorf("DefaultRequestTimeoutInSeconds = %d, want 30", gotTimeout)
+	}
+}
+
+func TestDoctor_LiveLLM_ProbeTimeout(t *testing.T) {
+	t.Parallel()
+
+	u := &fakeUI{} //nolint:exhaustruct // recorders zero.
+	d := testDeps()
+	d.ui = u
+	d.doctorLiveProbeTimeout = time.Millisecond
+	d.newChatModel = func(context.Context, config.Config, func(schema.Usage)) (chatModel, error) {
+		return &seqBlockThenAnswerModel{answer: "unused"}, nil //nolint:exhaustruct // calls zero
+	}
+
+	_, err := runWithArgs(t, d, []string{"doctor", "--live-llm"})
+	if !errors.Is(err, ErrLLMUnavailable) {
+		t.Fatalf("err = %v, want ErrLLMUnavailable", err)
+	}
+	if len(u.llmStatuses) != 1 || u.llmStatuses[0].State != ui.ConnectorError {
+		t.Errorf("llmStatuses = %+v, want one Error status", u.llmStatuses)
 	}
 }
 
