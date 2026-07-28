@@ -58,8 +58,8 @@ writes the gitignored `*_mock_test.go` mocks. **Run `make generate` before
   evaluator: it reads the workflow as written, so it cannot follow a secret name assembled
   at runtime. The suite asserts each fixture is parseable YAML before using it, since the
   case that motivated this (#216) was a fixture no parser accepts, which pinned nothing.
-  Then the Scoop-manifest
-  renderer and both strict asset-digest lookups (`sha_for` over the manifest TSV,
+  Then the Scoop-manifest and Homebrew-Formula
+  renderers and both strict asset-digest lookups (`sha_for` over the manifest TSV,
   `sha_for_checksums` over `checksums.txt`; each must fail on a duplicate row rather than return
   the first match) unit tests, the release asset-set assertion's unit tests (the
   fail-closed-on-missing-digest branches plus the generate-mode artifact-type allowlist:
