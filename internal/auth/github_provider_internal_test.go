@@ -123,22 +123,6 @@ func TestGithubAuthorizeAction_DeniesGraphQL(t *testing.T) {
 	}
 }
 
-// TestGithubAuthorizeAction_GraphQLHostOverrideNotBypassed verifies that a /graphql
-// request with a download-host Host: override is denied (GraphQL check precedes the
-// download-host fast-path, so the override cannot slip it through).
-func TestGithubAuthorizeAction_GraphQLHostOverrideNotBypassed(t *testing.T) {
-	t.Parallel()
-	p, _ := testGithubProvider(t, githubhardening.BaselineExposure(), okFetch)
-	req, _ := http.NewRequestWithContext(
-		context.Background(), http.MethodGet, "https://api.github.com/graphql", nil,
-	)
-	req.Host = "codeload.github.com"
-	err := p.AuthorizeAction(context.Background(), req, nil)
-	if !errors.Is(err, githubhardening.ErrGraphQLUnsupported) {
-		t.Fatalf("AuthorizeAction(GET /graphql, Host=codeload) err = %v, want ErrGraphQLUnsupported", err)
-	}
-}
-
 // TestGithubAuthorizeAction_EncodedGraphQLFailsClosed documents that a
 // percent-encoded GraphQL probe does not bypass the deny. GitHub routes only the
 // literal /graphql, so IsGraphQLEndpoint is an exact match; an encoded form
@@ -188,52 +172,34 @@ func TestGithubProvider_downloadHostGetOnly(t *testing.T) {
 	); err != nil {
 		t.Errorf("download GET = %v, want nil", err)
 	}
+	// net/url preserves host case, so effectiveDownloadHost must lower-case the
+	// hostname before matching it against the download-host set.
+	if err := p.AuthorizeAction(
+		context.Background(), req(t, "GET", "https://CODELOAD.GitHub.com/o/r/tarball/main"), nil,
+	); err != nil {
+		t.Errorf("download GET (upper-case host) = %v, want nil", err)
+	}
 	if err := p.AuthorizeAction(
 		context.Background(), req(t, "POST", "https://codeload.github.com/o/r/x"), nil,
-	); err == nil {
-		t.Error("download POST = nil, want denied")
+	); !errors.Is(err, githubhardening.ErrExposureExceeded) {
+		t.Errorf("download POST = %v, want ErrExposureExceeded", err)
 	}
 }
 
-func TestGithubProvider_downloadHostViaOverride(t *testing.T) {
+// TestGithubAuthorizeAction_GraphQLDeniedOnDownloadHost pins the ordering of the
+// GraphQL check and the download-host fast path. IsGraphQLEndpoint matches on the
+// path only, so if the download branch ran first a /graphql request to a download
+// host would take the table-free GET fast path and return nil with the token
+// attached.
+func TestGithubAuthorizeAction_GraphQLDeniedOnDownloadHost(t *testing.T) {
 	t.Parallel()
 
 	p, _ := testGithubProvider(t, githubhardening.BaselineExposure(), okFetch)
-	// A Host override naming a download host pulls the request under the
-	// GET/HEAD-only gate even though the URL host is api.github.com.
-	r := req(t, "POST", "https://api.github.com/x")
-	r.Host = "CODELOAD.GITHUB.COM:443"
-	if err := p.AuthorizeAction(context.Background(), r, nil); !errors.Is(err, githubhardening.ErrExposureExceeded) {
-		t.Errorf("override download host POST = %v, want ErrExposureExceeded", err)
-	}
-
-	// A Host override naming a download host for GET is allowed via the download branch.
-	rGet := req(t, "GET", "https://api.github.com/o/r/tarball/main")
-	rGet.Host = "codeload.github.com"
-	if err := p.AuthorizeAction(context.Background(), rGet, nil); err != nil {
-		t.Errorf("override download host GET = %v, want nil", err)
-	}
-}
-
-// TestGithubProvider_downloadURLWithAPIHostOverride verifies that a codeload
-// URL combined with a Host: api.github.com override does NOT take the download
-// fast-path. The Host header is the effective served authority on GitHub's
-// shared infrastructure, so the request falls through to classification. The
-// codeload path is not an api.github.com route, so it returns an error.
-func TestGithubProvider_downloadURLWithAPIHostOverride(t *testing.T) {
-	t.Parallel()
-
-	p, _ := testGithubProvider(t, githubhardening.BaselineExposure(), okFetch)
-	r := req(t, "GET", "https://codeload.github.com/o/r/tarball/main")
-	r.Host = "api.github.com"
-	err := p.AuthorizeAction(context.Background(), r, nil)
-	if err == nil {
-		t.Fatal("codeload URL + Host: api.github.com GET = nil, want an error (unclassifiable as api route)")
-	}
-	// The codeload path does not match any api.github.com route template, so
-	// classification fails closed with ErrUnclassifiable.
-	if !errors.Is(err, githubhardening.ErrUnclassifiable) {
-		t.Errorf("codeload URL + Host: api.github.com GET = %v, want ErrUnclassifiable", err)
+	err := p.AuthorizeAction(
+		context.Background(), req(t, "GET", "https://codeload.github.com/graphql"), nil,
+	)
+	if !errors.Is(err, githubhardening.ErrGraphQLUnsupported) {
+		t.Fatalf("AuthorizeAction(GET codeload /graphql) err = %v, want ErrGraphQLUnsupported", err)
 	}
 }
 

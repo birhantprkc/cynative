@@ -195,23 +195,14 @@ func (p *gitlabProvider) expectedPort() string {
 
 // authorizeRequestPort rejects a request whose port differs from the connector's
 // configured (or default-443) port. AuthorizesHost only sees the port-stripped
-// hostname (the transport passes req.URL.Hostname() and pins only the hostname of
-// a Host override), so without this gate a model could target a different TLS port
-// on the pinned host/IP — or send a mismatched Host-override authority — and have
-// the injected Bearer token attached under an unpinned port.
+// hostname, so without this gate a model could target a different TLS port on the
+// pinned host or IP and have the injected Bearer token attached under an unpinned
+// port.
 func (p *gitlabProvider) authorizeRequestPort(req *http.Request) error {
 	want := p.expectedPort()
 	if got := portOfAuthority(req.URL.Host); got != want {
 		return fmt.Errorf("%w: request port %s does not match configured GitLab port %s (provider gitlab)",
 			ErrHostNotAuthorized, got, want)
-	}
-	// A model-supplied Host header overrides the request authority; the transport
-	// pins only its hostname, so pin its port here too.
-	if req.Host != "" && req.Host != req.URL.Host {
-		if got := portOfAuthority(req.Host); got != want {
-			return fmt.Errorf("%w: Host override port %s does not match configured GitLab port %s (provider gitlab)",
-				ErrHostNotAuthorized, got, want)
-		}
 	}
 	return nil
 }
@@ -421,10 +412,10 @@ func bodyMultipartHasCredential(body string) bool {
 }
 
 // AuthorizeAction enforces the per-category exposure ceiling. It rejects smuggled
-// controls and a port/Host-override mismatch, denies the GraphQL endpoint
-// unconditionally, rejects a smuggled body credential, then classifies the
-// request to its GitLab category and required level and allows it only when the
-// configured ceiling permits that level. A request that cannot be classified (any
+// controls and a port mismatch, denies the GraphQL endpoint unconditionally,
+// rejects a smuggled body credential, then classifies the request to its GitLab
+// category and required level and allows it only when the configured ceiling
+// permits that level. A request that cannot be classified (any
 // non-/api/v4 path fails closed here), a missing table, an unknown configured key,
 // or an exceeded ceiling all fail closed. Runs before InjectAuth.
 func (p *gitlabProvider) AuthorizeAction(ctx context.Context, req *http.Request, rawArgs json.RawMessage) error {

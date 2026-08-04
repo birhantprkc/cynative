@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -56,38 +57,11 @@ func providerNames(providers []auth.Provider) string {
 	return strings.Join(names, ", ")
 }
 
-// hostnameOnly strips an optional port (and one pair of IPv6 brackets) from a
-// Host header value, mirroring [url.URL.Hostname] for the override authority.
-// Malformed values are returned verbatim so they fail closed at the provider.
-func hostnameOnly(hostport string) string {
-	if h, _, err := net.SplitHostPort(hostport); err == nil {
-		return h
-	}
-
-	if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") {
-		return hostport[1 : len(hostport)-1]
-	}
-
-	return hostport
-}
-
-// authorizeHostOverride authorizes req.Host when it differs from req.URL.Host,
-// i.e. when the model supplied an explicit Host header that overrides the URL
-// authority.  [http.NewRequestWithContext] mirrors URL.Host into req.Host, so
-// equality means no override and no second check is needed.
-func authorizeHostOverride(
-	ctx context.Context,
-	req *http.Request,
-	providerName string,
-	providers []auth.Provider,
-	rawArgs json.RawMessage,
-) error {
-	if req.Host == "" || req.Host == req.URL.Host {
-		return nil
-	}
-
-	return auth.AuthorizeHost(ctx, providerName, hostnameOnly(req.Host), providers, rawArgs)
-}
+// ErrReservedHeader is returned when the model supplies a header whose value the
+// transport owns. Today that is Host: Go derives the wire authority from the URL,
+// and letting the model set it separately would split the authority the auth
+// gates classify from the authority actually sent.
+var ErrReservedHeader = errors.New("http_request: reserved header")
 
 // certPoolFunc is the type of a function that returns the system certificate pool.
 type certPoolFunc func() (*x509.CertPool, error)
@@ -141,7 +115,7 @@ type RequestArgs struct {
 
 	URL string `json:"url" jsonschema_description:"The full URL to request (e.g. \"https://api.example.com:8080/v1/users?q=hello\"). Must not embed userinfo (user:pass@): credentials are injected automatically by the auth_provider and model-supplied ones are rejected."` //nolint:lll // struct tags are indivisible
 
-	Headers []KeyValue `json:"headers,omitempty" jsonschema_description:"List of HTTP headers. Omit if none. Never include credential headers (Authorization, Proxy-Authorization, X-Ms-Authorization-Auxiliary, Private-Token, Job-Token): credentials are injected automatically by the auth_provider and model-supplied ones are rejected."` //nolint:lll // struct tags are indivisible
+	Headers []KeyValue `json:"headers,omitempty" jsonschema_description:"List of HTTP headers. Omit if none. Never include Host: the request authority is derived from url, and a model-supplied Host header is rejected. Never include credential headers (Authorization, Proxy-Authorization, X-Ms-Authorization-Auxiliary, Private-Token, Job-Token): credentials are injected automatically by the auth_provider and model-supplied ones are rejected."` //nolint:lll // struct tags are indivisible
 	Body    string     `json:"body,omitempty"    jsonschema_description:"The request body as a string. Omit if none."`
 
 	TimeoutSeconds      int `json:"timeout_seconds,omitempty"        jsonschema_description:"Request timeout in seconds (1-60, default 20)."`
@@ -216,13 +190,18 @@ func (c *Client) do(
 
 	req.Header.Set("User-Agent", "Cynative-Research/1.0")
 
-	// Host: Go ignores req.Header["Host"], so we set req.Host directly.
-	// Accept-Encoding: dropped so Go's transport handles decompression transparently.
-	// Others: Add (not Set) to support duplicate keys (e.g. multiple Cookies).
+	// Host is transport-owned: Go derives it from the URL, so letting the model set
+	// it would split the authority the auth gates classify from the authority sent
+	// on the wire. Accept-Encoding is dropped so Go's transport handles
+	// decompression transparently. Others use Add (not Set) to support duplicate
+	// keys (e.g. multiple Cookies).
 	for _, h := range args.Headers {
 		if strings.EqualFold(h.Key, "Host") {
-			req.Host = h.Value
-		} else if !strings.EqualFold(h.Key, "Accept-Encoding") {
+			return nil, 0, noop, fmt.Errorf(
+				"%w: %q is derived from the url and cannot be set; put the authority in url",
+				ErrReservedHeader, h.Key)
+		}
+		if !strings.EqualFold(h.Key, "Accept-Encoding") {
 			req.Header.Add(h.Key, h.Value)
 		}
 	}
@@ -240,10 +219,6 @@ func (c *Client) do(
 	rawArgs := json.RawMessage(arguments)
 
 	if hostErr := auth.AuthorizeHost(ctx, args.AuthProvider, req.URL.Hostname(), providers, rawArgs); hostErr != nil {
-		return nil, 0, noop, hostErr
-	}
-
-	if hostErr := authorizeHostOverride(ctx, req, args.AuthProvider, providers, rawArgs); hostErr != nil {
 		return nil, 0, noop, hostErr
 	}
 
