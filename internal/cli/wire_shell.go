@@ -2,14 +2,19 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"golang.org/x/term"
 
+	"github.com/cynative/cynative"
 	"github.com/cynative/cynative/internal/agent"
+	"github.com/cynative/cynative/internal/agentcatalog"
 	"github.com/cynative/cynative/internal/audit"
 	"github.com/cynative/cynative/internal/auth"
 	"github.com/cynative/cynative/internal/config"
@@ -82,6 +87,87 @@ func buildController(editor *editorTarget, state *interrupt.State) *ui.TerminalC
 	return ctrl
 }
 
+// newAuditSinkShell opens the audit log and stamps it with the actor and, when
+// an agent framed the run, its provenance.
+//
+// It is a named function rather than an inline closure in newDeps because
+// gocyclo/gocognit attribute a closure's branches to its enclosing function,
+// and newDeps already carries the controller branches; inlining this pushes it
+// past the complexity-6 shell budget.
+func newAuditSinkShell(cfg config.Config, prov *audit.AgentProvenance) (audit.Sink, func() error, error) {
+	if !cfg.Audit.Enabled {
+		return nil, func() error { return nil }, nil
+	}
+
+	w, err := audit.Open(audit.FileConfig{
+		Path:          cfg.Audit.Path,
+		MaxSizeMB:     cfg.Audit.MaxSizeMB,
+		RetentionDays: cfg.Audit.RetentionDays,
+		Compress:      cfg.Audit.Compress,
+	})
+	if err != nil {
+		return nil, nil, err // runResearch wraps with "open audit log:".
+	}
+
+	opts := []audit.Option{audit.WithActor(cfg.LLM.Provider + "/" + cfg.LLM.Model)}
+	if prov != nil {
+		opts = append(opts, audit.WithAgent(*prov))
+	}
+
+	return audit.New(w, opts...), w.Close, nil
+}
+
+// openAgentCatalogShell builds the production agent catalog from the operator's
+// home directory and the embedded built-ins.
+//
+// The working directory is deliberately not consulted: agents are
+// operator-authored configuration, so a checkout must not be able to supply the
+// prompt for a run.
+func openAgentCatalogShell() (*agentcatalog.Catalog, func(), error) {
+	home, err := resolveHomeDir()
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve home directory: %w", err)
+	}
+
+	return agentcatalog.OpenSources(home, cynative.BuiltinAgents())
+}
+
+// resolveDir returns get()'s directory with symlinks resolved.
+func resolveDir(get func() (string, error)) (string, error) {
+	dir, err := get()
+	if err != nil {
+		return "", err
+	}
+
+	return filepath.EvalSymlinks(dir)
+}
+
+// resolveHomeDir resolves the home directory, tolerating one that does not
+// exist.
+//
+// A minimal container can set an absolute $HOME that was never created. Failing
+// here would abort the whole catalog, so even `cynative agents list` could not
+// inspect the built-in tier. An unresolvable home is returned cleaned-and-
+// absolute instead: OpenSources then finds no user agents directory and skips
+// that tier.
+func resolveHomeDir() (string, error) {
+	home, err := resolveDir(os.UserHomeDir)
+	if err == nil {
+		return home, nil
+	}
+
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+
+	raw, rerr := os.UserHomeDir()
+	if rerr != nil {
+		return "", rerr
+	}
+
+	return filepath.Clean(raw), nil
+}
+
 // newDeps wires the production collaborators for the cli. It is the composition
 // root: the only place that reads the real environment — [os.LookupEnv] (via the
 // config loader), the auth providers, stdio, and the glamour-backed UI — so it
@@ -115,33 +201,19 @@ func newDeps() *deps {
 		},
 		newHTTPRequestTool:   tools.NewHTTPRequestTool,
 		newCodeExecutionTool: tools.NewCodeExecutionTool,
-		newAuditSink: func(cfg config.Config) (audit.Sink, func() error, error) {
-			if !cfg.Audit.Enabled {
-				return nil, func() error { return nil }, nil
-			}
-			w, err := audit.Open(audit.FileConfig{
-				Path:          cfg.Audit.Path,
-				MaxSizeMB:     cfg.Audit.MaxSizeMB,
-				RetentionDays: cfg.Audit.RetentionDays,
-				Compress:      cfg.Audit.Compress,
-			})
-			if err != nil {
-				return nil, nil, err // runResearch wraps with "open audit log:".
-			}
-
-			return audit.New(w, audit.WithActor(cfg.LLM.Provider+"/"+cfg.LLM.Model)), w.Close, nil
-		},
-		newAgent:            agent.New,
-		ui:                  newUI(inR, promptW, editor, ctrl, state.Interrupted),
-		out:                 os.Stdout,
-		errOut:              os.Stderr,
-		cfg:                 config.Config{}, //nolint:exhaustruct // populated by PersistentPreRunE.
-		stdinIsTTY:          stdinIsTTY,
-		hasTerminal:         hasTerminal,
-		readStdin:           readStdin,
-		interrupter:         interrupter,
-		version:             versionString(),
-		newDoctorProbeNonce: doctorProbeNonce,
+		newAuditSink:         newAuditSinkShell,
+		openAgentCatalog:     openAgentCatalogShell,
+		newAgent:             agent.New,
+		ui:                   newUI(inR, promptW, editor, ctrl, state.Interrupted),
+		out:                  os.Stdout,
+		errOut:               os.Stderr,
+		cfg:                  config.Config{}, //nolint:exhaustruct // populated by PersistentPreRunE.
+		stdinIsTTY:           stdinIsTTY,
+		hasTerminal:          hasTerminal,
+		readStdin:            readStdin,
+		interrupter:          interrupter,
+		version:              versionString(),
+		newDoctorProbeNonce:  doctorProbeNonce,
 	}
 	d.run = d.runResearch
 

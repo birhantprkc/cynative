@@ -23,7 +23,6 @@ credentials the operator supplies.
    filesystem or packages.
 3. **Agent to provider** - credentials attach only after the gate
    authorizes and the host and resolved IP are verified.
-
 The model never holds credentials and never chooses the policy, so it
 cannot move any of these lines.
 
@@ -43,6 +42,12 @@ cannot move any of these lines.
   process; scripts run in the JS sandbox.
 - **Request redirection** - hosts pinned, resolved IP verified before
   connect.
+- **Repository-supplied prompts** - agents are read only from
+  `~/.cynative/agents/` and the binary, never from the working directory,
+  so cloning a repository cannot change what cynative does with the
+  operator's credentials. Selection is always explicit by name and the
+  model never chooses an agent. Every audited tool call records the
+  agent's name, source and file digest.
 - **Credential leakage** - no credential store; secrets are redacted from
   tool results and the audit log, which is readable only by the running
   user.

@@ -205,6 +205,15 @@ supplies the shared message/tool types, and `internal/llm` supplies the Bifrost-
 
 - **`cmd/cynative`**: a thin `main` that calls `cli.Execute()`.
 
+- **`agents.go`** (package `cynative`, module root): `//go:embed all:agents` plus a one-line
+  accessor for the built-in agent tier. It sits at the root for the same reason `about.go`
+  does: `go:embed` cannot reference a parent directory. The `all:` prefix is load-bearing —
+  it includes dot-prefixed files, and the directory ships holding only `.keep`; plain
+  `//go:embed agents` fails to compile with "contains no embeddable files", and an empty
+  directory cannot be committed to git either. The accessor returns the whole tree rather
+  than the `fs.Sub` subtree because that error cannot occur for a fixed valid path, and a
+  defensive branch here could never be covered.
+
 - **`about.go`** (package `cynative`, module root): the README is the single source for two
   runtime values, each extracted from between a pair of HTML-comment markers in `README.md`.
   `About()` (a string, `agent-about`) feeds `agent.Config.About` and lands in the system prompt
@@ -706,6 +715,46 @@ supplies the shared message/tool types, and `internal/llm` supplies the Bifrost-
   providerOperations GET) and `GetJSON` (gcp's Discovery catalog only; also returns the status
   code so a caller can tell a permanent 404/410 from a retryable miss).
 
+- **`internal/agentcatalog`**: resolves named markdown agent files and composes them into
+  the prompt for a run (`--agent`). Two sources, first match wins: `~/.cynative/agents/`
+  and the built-ins embedded from `agents/` at the repo root. `New` is pure and owns no
+  OS handles; the shell entry point `OpenSources(home, builtin)` returns the catalog plus
+  the cleanup that closes its retained `*os.Root` handles, and the CLI's `runRoot` is the
+  sole owner of that cleanup. Invariants:
+  - **The working directory is never a source.** An agent supplies the prompt for a run,
+    which makes it operator-authored configuration, so reading one from a checkout would
+    mean cloning a repository could change what cynative does with the operator's
+    credentials. There is deliberately no project tier and no cwd parameter.
+  - **The agents directory is opened as ONE multi-component name through a root at the
+    home directory** (`boundary.OpenRoot(".cynative/agents")`). `os.OpenRoot` resolves
+    symlinks in the path it is *given*, so opening the agents path directly follows an
+    escaping symlink straight out. Nesting a second root at `.cynative` would be weaker
+    still: a contained `.cynative` symlink would confine `agents` to the symlink's target
+    rather than to home. Contained directory symlinks are permitted (an operator may point
+    `~/.cynative` at a dotfiles directory); the agent **file** must be a regular
+    non-symlink, since its bytes enter the prompt.
+  - **A claimed source that cannot be opened is an error, not a skip.** `hasAgentsDir`
+    probes `.cynative` and `agents` separately, because an intermediate dangling symlink
+    hides everything beneath it from a stat of the full path; a `.cynative` that is a
+    regular file is an absent source, since a file cannot hold an agents entry and
+    treating it as claimed made the child lookup fail with ENOTDIR and took the built-in
+    tier down with it.
+  - **Resolution fails closed.** Only a missing directory or a missing entry falls through
+    to the built-in tier. A claimed-but-unusable candidate (escaping symlink, symlinked or
+    non-regular file, unreadable, oversized, malformed) is an error wrapping
+    `ErrAgentInvalid`, so a typo in a user agent surfaces instead of silently running a
+    built-in of the same name.
+  - **Frontmatter is a closed schema**: exactly one YAML document, one untagged mapping,
+    the sole key `description` as a non-empty single-line `!!str` scalar. The tag checks are
+    load-bearing because yaml.v3 coerces `description: 123` into `"123"` even under
+    `KnownFields(true)`, and the exactly-one-pair check is what rejects duplicate keys and
+    defined aliases, since decoding into a `yaml.Node` reports neither. Single-line covers
+    U+2028/U+2029, which a renderer that honours them would use to break out of an
+    `agents list` row. A `---` line after the closing fence is body, not a second document.
+    `FuzzParse` pins the fail-closed contract.
+  - `Compose` emits its three labels unconditionally, so a composed task is never empty.
+    The CLI's bare-session `Welcome` skip depends on that and on nothing else.
+
 - **`internal/cache`**: stdlib-only leaf holding the one on-disk cache primitive,
   `TTLCache[T]` (in-memory → on-disk per TTL → fetch, with stale-on-error fallback), plus
   `Config{Dir, TTL, Clock}`, which every connector cache embeds. It imports nothing from
@@ -811,6 +860,12 @@ supplies the shared message/tool types, and `internal/llm` supplies the Bifrost-
   triggered rotate error); the shell (`Open`) seeds the oldest-record time from the existing
   file's first line, adds size rotation via lumberjack, and forces mode 0600. Mapped from
   `config.AuditConfig` (`enabled`/`path`/`max_size_mb`/`retention_days`/`compress`).
+  `Record.Agent` carries the agent file that framed the run (name, source, SHA-256 over the
+  raw bytes, never the body) and is stamped by the Logger like `Actor`, so a tool call cannot
+  forge it. `Source` is a **string**, not `agentcatalog.Source`: this package is a leaf that
+  must not import the catalog, and an integer enum would be an unstable value in a forensic
+  log. The Python connector-audit parsers read named keys only, so the added field is inert
+  to them.
   `context.go` carries four per-call recorders, and they are the reason the loop's safety
   properties are not string-matched. `invokeIO` installs three of them before every I/O dispatch:
   - `Scope` stamps session/run/depth so the inner tool records emitted **via** `code_execution`
