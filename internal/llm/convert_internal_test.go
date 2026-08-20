@@ -465,3 +465,125 @@ func TestSchemaToolsToParams_Empty(t *testing.T) {
 		t.Errorf("expected nil for no tools")
 	}
 }
+
+func TestSchemaFromBifrostMessage_MultipleTextContentBlocks(t *testing.T) {
+	t.Parallel()
+
+	// Bifrost's Gemini adapter emits one content block per response part and
+	// collapses to ContentStr only when there is exactly one text block, so a
+	// reply split across parts arrives as ContentBlocks. Reading ContentStr
+	// alone dropped the whole answer and the agent loop saw an empty turn.
+	first, second := "The project has ", "three findings."
+	bm := bschemas.ChatMessage{ //nolint:exhaustruct // only fields under test
+		Role: bschemas.ChatMessageRoleAssistant,
+		Content: &bschemas.ChatMessageContent{ //nolint:exhaustruct // only ContentBlocks
+			ContentBlocks: []bschemas.ChatContentBlock{
+				{Type: bschemas.ChatContentBlockTypeText, Text: &first},  //nolint:exhaustruct // text block only
+				{Type: bschemas.ChatContentBlockTypeText, Text: &second}, //nolint:exhaustruct // text block only
+			},
+		},
+	}
+
+	out := schemaFromBifrostMessage(bm)
+
+	if got := out.Text(); got != "The project has three findings." {
+		t.Errorf("text = %q, want the joined parts", got)
+	}
+}
+
+func TestSchemaFromBifrostMessage_SkipsEmptyAndNonTextBlocks(t *testing.T) {
+	t.Parallel()
+
+	empty, wanted := "", "the answer"
+	bm := bschemas.ChatMessage{ //nolint:exhaustruct // only fields under test
+		Role: bschemas.ChatMessageRoleAssistant,
+		Content: &bschemas.ChatMessageContent{ //nolint:exhaustruct // only ContentBlocks
+			ContentBlocks: []bschemas.ChatContentBlock{
+				{Type: bschemas.ChatContentBlockTypeImage, Text: &wanted}, //nolint:exhaustruct // non-text block
+				{Type: bschemas.ChatContentBlockTypeText, Text: nil},      //nolint:exhaustruct // nil text
+				{Type: bschemas.ChatContentBlockTypeText, Text: &empty},   //nolint:exhaustruct // empty text
+				{Type: bschemas.ChatContentBlockTypeText, Text: &wanted},  //nolint:exhaustruct // the only text block
+			},
+		},
+	}
+
+	out := schemaFromBifrostMessage(bm)
+
+	if got := out.Text(); got != "the answer" {
+		t.Errorf("text = %q, want only the non-empty text block", got)
+	}
+	if len(out.Content) != 1 {
+		t.Errorf("content blocks = %d, want 1", len(out.Content))
+	}
+}
+
+func TestSchemaFromBifrostMessage_RefusalBecomesTheAnswer(t *testing.T) {
+	t.Parallel()
+
+	// An OpenAI-family refusal arrives with null content and a refusal string. Read
+	// only from content, it looked like a blank turn: the agent loop retried it and
+	// reported repeated empty responses instead of showing the operator what the
+	// model actually said.
+	refusal := "I can't help with that request."
+	bm := bschemas.ChatMessage{ //nolint:exhaustruct // only fields under test
+		Role: bschemas.ChatMessageRoleAssistant,
+		ChatAssistantMessage: &bschemas.ChatAssistantMessage{ //nolint:exhaustruct // only Refusal
+			Refusal: &refusal,
+		},
+	}
+
+	out := schemaFromBifrostMessage(bm)
+
+	if got := out.Text(); got != refusal {
+		t.Errorf("text = %q, want the refusal", got)
+	}
+}
+
+func TestSchemaFromBifrostMessage_RefusalContentBlock(t *testing.T) {
+	t.Parallel()
+
+	// The same refusal can arrive as a content block instead of a message field.
+	refusal := "I won't do that."
+	bm := bschemas.ChatMessage{ //nolint:exhaustruct // only fields under test
+		Role: bschemas.ChatMessageRoleAssistant,
+		Content: &bschemas.ChatMessageContent{ //nolint:exhaustruct // only ContentBlocks
+			ContentBlocks: []bschemas.ChatContentBlock{
+				{Type: bschemas.ChatContentBlockTypeRefusal, Refusal: &refusal}, //nolint:exhaustruct // refusal block
+			},
+		},
+	}
+
+	out := schemaFromBifrostMessage(bm)
+
+	if got := out.Text(); got != refusal {
+		t.Errorf("text = %q, want the refusal", got)
+	}
+}
+
+func TestTextBlocks_EmptyContentAllocatesNothing(t *testing.T) {
+	t.Parallel()
+
+	// A turn with no prose must produce no blocks and no backing array: the agent
+	// loop distinguishes a blank turn from an answer, and every response goes
+	// through here.
+	blank := ""
+	cases := map[string]*bschemas.ChatMessageContent{
+		"nil content":  nil,
+		"zero content": {},                   //nolint:exhaustruct // both halves unset on purpose.
+		"blank string": {ContentStr: &blank}, //nolint:exhaustruct // only ContentStr.
+		"no-prose blocks": {ContentBlocks: []bschemas.ChatContentBlock{ //nolint:exhaustruct // only ContentBlocks.
+			{Type: bschemas.ChatContentBlockTypeImage},      //nolint:exhaustruct // type only.
+			{Type: bschemas.ChatContentBlockTypeInputAudio}, //nolint:exhaustruct // type only.
+		}},
+	}
+
+	for name, in := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := textBlocks(in); got != nil {
+				t.Errorf("textBlocks = %#v, want nil", got)
+			}
+		})
+	}
+}

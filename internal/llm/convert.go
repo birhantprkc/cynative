@@ -113,15 +113,86 @@ func schemaToBifrostToolCalls(in []schema.ToolCallBlock) []bschemas.ChatAssistan
 	return calls
 }
 
+// textBlocks extracts a message's assistant prose as schema text blocks. Bifrost
+// carries content in one of two shapes and providers disagree on which: Anthropic
+// joins every text part into ContentStr, while Gemini emits one ContentBlock per
+// response part and collapses to ContentStr only when exactly one text block
+// exists. Reading ContentStr alone therefore dropped the entire answer of any
+// multi-part Gemini reply, which reached the agent loop as an empty turn and
+// ended the run. Empty and non-text blocks contribute nothing.
+func textBlocks(c *bschemas.ChatMessageContent) []schema.Block {
+	if c == nil {
+		return nil
+	}
+
+	// Size the result up front so a many-part reply appends without regrowing.
+	// Bifrost sets only one of the two halves, so this is an upper bound, and it is
+	// computed from one evaluation of the text rather than a repeated nil-and-empty
+	// test that could drift from the append below.
+	str := deref(c.ContentStr)
+	n := len(c.ContentBlocks)
+	if str != "" {
+		n++
+	}
+	if n == 0 {
+		return nil
+	}
+
+	out := make([]schema.Block, 0, n)
+	if str != "" {
+		out = append(out, schema.TextBlock{Text: str})
+	}
+	for _, blk := range c.ContentBlocks {
+		if text := blockText(blk); text != "" {
+			out = append(out, schema.TextBlock{Text: text})
+		}
+	}
+	// A message whose blocks were all non-prose (images, audio, files) has nothing
+	// for the operator; report that as no blocks rather than an empty slice.
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
+}
+
+// blockText returns the operator-facing prose of one content block, or "" for a
+// block that carries none. A refusal counts: it is what the model said, and
+// dropping it left the loop with a blank turn to retry instead of an answer to
+// show.
+func blockText(blk bschemas.ChatContentBlock) string {
+	if blk.Type == bschemas.ChatContentBlockTypeText {
+		return deref(blk.Text)
+	}
+	if blk.Type == bschemas.ChatContentBlockTypeRefusal {
+		return deref(blk.Refusal)
+	}
+
+	// Image, audio and file blocks carry no prose for the operator.
+	return ""
+}
+
+// deref reads an optional Bifrost string field.
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+
+	return *s
+}
+
 // schemaFromBifrostMessage converts a Bifrost chat message into an internal schema message.
 func schemaFromBifrostMessage(bm bschemas.ChatMessage) *schema.Message {
 	out := &schema.Message{Role: schema.Role(bm.Role)} //nolint:exhaustruct // optional fields set below
 
-	if bm.Content != nil && bm.Content.ContentStr != nil && *bm.Content.ContentStr != "" {
-		out.Content = append(out.Content, schema.TextBlock{Text: *bm.Content.ContentStr})
-	}
+	out.Content = append(out.Content, textBlocks(bm.Content)...)
 
 	if bm.ChatAssistantMessage != nil {
+		// A refusal can arrive as a message field rather than a content block, which
+		// is the OpenAI shape: null content plus a refusal string.
+		if refusal := deref(bm.ChatAssistantMessage.Refusal); refusal != "" {
+			out.Content = append(out.Content, schema.TextBlock{Text: refusal})
+		}
 		for _, tc := range bm.ChatAssistantMessage.ToolCalls {
 			call := schema.ToolCallBlock{Arguments: tc.Function.Arguments} //nolint:exhaustruct // ID/Name set below
 			if tc.ID != nil {
