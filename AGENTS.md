@@ -193,7 +193,15 @@ writes the gitignored `*_mock_test.go` mocks. **Run `make generate` before
   The parser is what stops a suite going green while the read-only boundary is broken: its exit code
   is the phase status (1 = retryable miss, 4 = boundary failure, never retried, since the per-attempt
   audit truncation would erase the evidence), and a first-line credential prepass fails closed (4) if
-  credential material was logged. **Sanctioning a read is a security decision, not a
+  credential material was logged. In the deny modes (canary/secretscan) a parser-proven attempt is
+  accepted even when the run itself exits 2 with no final answer: the prose adds no evidence there,
+  and retrying would truncate away records that already proved the phase. The hold is trustworthy
+  however the run ended, because the audit is write-ahead on both dispatch paths (the attempt
+  record lands before the request runs; a failed attempt-write refuses to run it) and the sweep
+  exits 4 on an unsanctioned attempt with no proven denial, so a crash-shortened log cannot hide
+  a dispatched call. The waiver still keeps to exit 2 exactly, the CLI's no-answer outcome (a
+  failed audit-log close exits 1 instead); timeouts, budget hits, and every other exit, mode, or
+  parser verdict keep the strict behavior (#286). **Sanctioning a read is a security decision, not a
   convenience**: `sweep_calls` exempts a sanctioned call from the fatal unsanctioned sweep
   *without looking at its result*, so whatever the read family admits can no longer be caught
   having succeeded. gcp/aws/github use the per-record `is_sanctioned_read`, which must stay a

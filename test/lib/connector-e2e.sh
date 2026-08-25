@@ -6,7 +6,7 @@
 # timeout guardrails (test/lib/e2e-guardrails.sh), which every caller here needs
 # anyway.
 #
-# Every caller of this file lives directly in test/ (the three connector suites plus
+# Every caller of this file lives directly in test/ (the four connector suites plus
 # this library's own unit test), so `dirname "$0"` at source time always resolves to
 # test/ - the same $0-relative trick the suites already use to find `root`/`here`.
 #
@@ -45,9 +45,11 @@ arbitrate() {
 # parser path, becomes 4) BEFORE anything else runs, and a 4 short-circuits before the
 # run classifier and every soft gate below - nothing may suppress or delay a security
 # failure. Only once the parser holds (0/1) does the run classifier (RC/OUT/ERR/
-# TIMEOUT) get consulted and the two arbitrated. A clean arbitration (0) then runs the
-# connector-specific posture check (POSTURE_FN), the generic tool-called assertion, and
-# (read mode only) checks EXPECT_VALUE landed in OUT.
+# TIMEOUT) get consulted and the two arbitrated; in canary/secretscan mode a parser
+# hold (0) waives the classifier's no-answer verdict (exit 2) rather than retry away
+# proven evidence (cynative#286; the full rationale sits on the waiver below). A clean
+# arbitration (0) then runs the connector-specific posture check (POSTURE_FN), the
+# generic tool-called assertion, and (read mode only) checks EXPECT_VALUE landed in OUT.
 connector_run_phase() {
 	_provider=$1
 	_mode=$2
@@ -85,7 +87,51 @@ connector_run_phase() {
 	# A breach short-circuits BEFORE the classifier and every soft gate: nothing may
 	# suppress or delay a security failure.
 	if [ "$_p" = 4 ]; then return 4; fi
-	if e2e_classify_run "$_rc" "$_out" "$_err" "$_timeout"; then _c=0; else _c=$?; fi
+	# Deny-mode waiver (cynative#286). In canary/secretscan mode the phase's evidence
+	# is the audit records the parser just validated - the model's closing prose adds
+	# nothing - so a parser hold (0) on a run that completed without a final answer
+	# must not become a retry: the retry's audit truncation would erase the records
+	# that already proved the phase. The hold is trustworthy however the run ended,
+	# because the audit is write-ahead on both dispatch paths (the attempt record is
+	# written BEFORE the request runs, and a failed attempt-write refuses to run it)
+	# and the sweep exits 4 on any unsanctioned attempt without a proven denial, so
+	# a log cut short by a crash cannot hide a call the boundary should have caught.
+	# The waiver is still scoped to exit 2 EXACTLY, the CLI's no-answer outcome (a
+	# failed deferred audit-log close replaces it with exit 1): every other nonzero
+	# exit signals an operational failure - provider, config, audit durability - that
+	# a retry should surface loudly rather than wave past, and a timeout keeps its
+	# retry the same way (rc 124 classifies to 2 below). A budget verdict (3) still
+	# dominates via the classifier, whose stderr is buffered on this one path because
+	# its no-answer FAIL line would otherwise sit in the log of a phase that then
+	# passes: on the waived verdict (1) an explanatory note replaces it, on any other
+	# verdict it is replayed verbatim. The mode allowlist is explicit so an unknown
+	# future mode keeps the strict behavior. Read mode is untouched: there the answer
+	# text is part of the evidence, and a no-answer run really is a miss.
+	_waive=0
+	case "$_mode" in
+		canary | secretscan) if [ "$_p" = 0 ] && [ "$_rc" = 2 ]; then _waive=1; fi ;;
+	esac
+	# `true`, not `:`, creates the buffer: a redirection failure on the special
+	# builtin `:` exits a non-interactive POSIX shell outright, while on the regular
+	# builtin `true` it just fails the command, landing in the unbuffered fallback.
+	if [ "$_waive" = 1 ] && true > "$_out.classify-err" 2>/dev/null; then
+		if e2e_classify_run "$_rc" "$_out" "$_err" "$_timeout" 2>"$_out.classify-err"; then
+			_c=0
+		else
+			_c=$?
+		fi
+		if [ "$_c" != 1 ]; then cat "$_out.classify-err" >&2; fi
+		rm -f "$_out.classify-err"
+	else
+		# Also the fallback when the buffer file cannot be created: classify
+		# unbuffered (the FAIL line then precedes the note, a cosmetic wart only)
+		# rather than skip the classifier and lose the budget check.
+		if e2e_classify_run "$_rc" "$_out" "$_err" "$_timeout"; then _c=0; else _c=$?; fi
+	fi
+	if [ "$_waive" = 1 ] && [ "$_c" = 1 ]; then
+		printf 'note: %s: no final answer (exit 2) but the audit parser already proved this phase from this attempt'\''s records; accepting (cynative#286)\n' "$_mode" >&2
+		_c=0
+	fi
 	arbitrate "$_p" "$_c"
 	_s=$?
 	if [ "$_s" != 0 ]; then return "$_s"; fi
