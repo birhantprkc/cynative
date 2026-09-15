@@ -30,6 +30,7 @@ import (
 	"github.com/cynative/cynative/internal/auth/authreq"
 	"github.com/cynative/cynative/internal/auth/authtest"
 	awshardening "github.com/cynative/cynative/internal/auth/aws"
+	"github.com/cynative/cynative/internal/auth/exposure"
 	githubhardening "github.com/cynative/cynative/internal/auth/github"
 	k8sauthz "github.com/cynative/cynative/internal/auth/k8s"
 )
@@ -3296,16 +3297,24 @@ func TestAKSAuthArgs_validate(t *testing.T) {
 
 // --- AuthorizeHost helper ---
 
+// hostAuthFake answers the host gate with a canned verdict. A non-nil seen
+// records the host string AuthorizeHost handed the provider, so a test can
+// assert AuthorizeHost passed it through unchanged.
 type hostAuthFake struct {
 	name string
 	ok   bool
 	err  error
+	seen *string
 }
 
 func (f *hostAuthFake) Name() string                                             { return f.name }
 func (f *hostAuthFake) Description() string                                      { return "fake" }
 func (f *hostAuthFake) InjectAuth(_ *http.Request, _ authreq.ProviderArgs) error { return nil }
-func (f *hostAuthFake) AuthorizesHost(_ context.Context, _ string, _ authreq.ProviderArgs) (bool, error) {
+func (f *hostAuthFake) AuthorizesHost(_ context.Context, host string, _ authreq.ProviderArgs) (bool, error) {
+	if f.seen != nil {
+		*f.seen = host
+	}
+
 	return f.ok, f.err
 }
 
@@ -3357,6 +3366,22 @@ func TestAuthorizeHost_CaseInsensitive(t *testing.T) {
 
 	if err := AuthorizeHost(context.Background(), "GitHub", "api.github.com", providers, nil); err != nil {
 		t.Fatalf("case-insensitive match: unexpected error: %v", err)
+	}
+}
+
+func TestAuthorizeHost_DoesNotLowerCaseItsInput(t *testing.T) {
+	t.Parallel()
+
+	var seen string
+	providers := []Provider{&hostAuthFake{name: "recorder", ok: true, seen: &seen}}
+
+	if err := AuthorizeHost(context.Background(), "recorder", "API.Example.com", providers, nil); err != nil {
+		t.Fatalf("AuthorizeHost: %v", err)
+	}
+
+	if seen != "API.Example.com" {
+		t.Fatalf("provider saw %q, want the caller's exact string; "+
+			"AuthorizeHost must not normalize, its caller already did", seen)
 	}
 }
 
@@ -4549,4 +4574,48 @@ func TestAKSProvider_AuthorizesAddr(t *testing.T) {
 			t.Fatal("cluster config error must deny (fail closed)")
 		}
 	})
+}
+
+func TestAuthorizeAction_BindsThePortOnTheCloudConnectors(t *testing.T) {
+	t.Parallel()
+
+	// github builds its provider from a real, populated table (via
+	// testGithubProvider/okFetch) rather than a bare newGithubProvider with a
+	// nil table source. A nil table source only reaches p.tables.Get on a
+	// mutant with the port guard deleted, and that call panics rather than
+	// returning an error, which would make the row's failure mode a crash
+	// instead of the assertion below.
+	cases := []struct {
+		name        string
+		newProvider func(t *testing.T) ActionAuthorizer
+	}{
+		{"github", func(t *testing.T) ActionAuthorizer {
+			p, _ := testGithubProvider(t, exposure.Exposure{}, okFetch)
+			return p
+		}},
+		{"aws", func(*testing.T) ActionAuthorizer { return &awsProvider{} }},
+		{"gcp", func(*testing.T) ActionAuthorizer { return &gcpProvider{} }},
+		{"azure", func(*testing.T) ActionAuthorizer { return &azureProvider{} }},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			v := authreq.View{
+				Method:      http.MethodGet,
+				Hostname:    "api.github.com",
+				Port:        "8443",
+				Path:        "/user",
+				EscapedPath: "/user",
+				Header:      http.Header{},
+			}
+
+			provider := tc.newProvider(t)
+			err := provider.AuthorizeAction(context.Background(), v, authreq.ProviderArgs{})
+			if !errors.Is(err, ErrHostNotAuthorized) {
+				t.Fatalf("AuthorizeAction on port 8443 = %v, want ErrHostNotAuthorized", err)
+			}
+		})
+	}
 }

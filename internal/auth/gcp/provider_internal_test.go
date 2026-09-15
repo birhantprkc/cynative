@@ -733,3 +733,56 @@ func TestProviderAuthorizeActionContainerReadDenied(t *testing.T) {
 		t.Fatalf("clusters.get under an empty role should be ErrPermissionDenied, got %v", err)
 	}
 }
+
+// TestResolveService_TrailingDotReportsIsWWW proves resolveService itself reports
+// isWWW from the same parse that resolves the service, so a trailing dot (which
+// ParseHost trims) does not change which branch it took. This pins resolveService
+// in isolation; TestProviderAuthorizeActionWWWClaimMismatchWithTrailingDot pins the
+// property that actually matters, which is that AuthorizeAction cannot skip the
+// gcp_auth.service claim check on a dotted host.
+func TestResolveService_TrailingDotReportsIsWWW(t *testing.T) {
+	t.Parallel()
+
+	// buildProvider's catalog resolves oauth2 from its servicePath "oauth2/v2/",
+	// so a path under it exercises ResolveWWWService without widening the helper.
+	v := authreq.View{
+		Method:      http.MethodGet,
+		Hostname:    "www.googleapis.com.",
+		Path:        "/oauth2/v2/tokeninfo",
+		EscapedPath: "/oauth2/v2/tokeninfo",
+		RawQuery:    "",
+		Header:      http.Header{},
+	}
+
+	_, isWWW, err := buildProvider(t).resolveService(context.Background(), v)
+	if err != nil {
+		t.Fatalf("resolveService: %v", err)
+	}
+
+	if !isWWW {
+		t.Fatal("resolveService reported isWWW=false for a dotted www.googleapis.com")
+	}
+}
+
+// TestProviderAuthorizeActionWWWClaimMismatchWithTrailingDot is A14 (see
+// TestProviderAuthorizeActionWWWClaimMismatch above) with a trailing dot on the
+// host. ParseHost trims the dot, so the request still resolves as the
+// www.googleapis.com compound, and the gcp_auth.service claim of "storage" still
+// does not match the path-resolved "oauth2": AuthorizeAction must deny with
+// ErrHostClaimMismatch. Before this fix, isWWW was computed by comparing the raw
+// hostname against the literal "www.googleapis.com", which a dotted host never
+// equals, so the claim check was silently skipped and this request was allowed.
+func TestProviderAuthorizeActionWWWClaimMismatchWithTrailingDot(t *testing.T) {
+	t.Parallel()
+
+	p := buildProvider(t)
+
+	err := p.AuthorizeAction(
+		context.Background(),
+		providerView(t, "GET", "https://www.googleapis.com./oauth2/v2/tokeninfo"),
+		gcpArgs(t, "storage"),
+	)
+	if !errors.Is(err, ErrHostClaimMismatch) {
+		t.Fatalf("dotted-host www claim mismatch should return ErrHostClaimMismatch, got %v", err)
+	}
+}

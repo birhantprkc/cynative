@@ -548,9 +548,10 @@ func TestExecute_HeaderKeyNearMissFailsClosed(t *testing.T) {
 }
 
 // TestExecute_WireAuthorityFollowsURL asserts the authority actually sent equals
-// the URL authority. This is the positive form of the invariant the whole change
-// exists to establish, and its r.Host read becomes the liveness canary for the
-// forbidigo pin once Task 6 adds that rule.
+// the URL authority: the host a gate authorizes is the host the client dials.
+// Its //nolint:forbidigo r.Host read is one of the canaries that keep the
+// http.Request.Host forbidigo pin live; if the pattern ever stopped matching,
+// nolintlint would flag the directive as unused.
 func TestExecute_WireAuthorityFollowsURL(t *testing.T) {
 	t.Parallel()
 
@@ -2542,5 +2543,66 @@ func TestRequestConstructionRejectsMalformedPort(t *testing.T) {
 	_, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://example.com:abc/p", nil)
 	if err == nil {
 		t.Fatal("new request error = nil, want a parse failure on a malformed port")
+	}
+}
+
+// TestExecute_RejectsNonASCIIHost pins the rejection and its position at once.
+// denyProvider refuses every host, so ErrNonASCIIHost can only come back while
+// the ASCII admission check still runs ahead of AuthorizeHost; move it below and
+// the error is ErrHostNotAuthorized, raised for a host the gate had already
+// folded to a name the request never carried.
+func TestExecute_RejectsNonASCIIHost(t *testing.T) {
+	t.Parallel()
+
+	// U+0130 lower-cases to a plain ASCII "i", so the gate would classify this
+	// as "i.example" while net/http dials "xn--i-9bb.example".
+	args := makeArgs(t, map[string]any{
+		"url":           "https://\u0130.example/p",
+		"auth_provider": "deny",
+	})
+
+	_, _, err := NewClient().Execute(context.Background(), args, []auth.Provider{&denyProvider{}})
+	if !errors.Is(err, auth.ErrNonASCIIHost) {
+		t.Fatalf("Execute = %v, want auth.ErrNonASCIIHost before any provider gate runs", err)
+	}
+}
+
+// hostSpyProvider records the host the transport handed the host gate and then
+// denies it, so a test reaches the recorder without depending on a dial.
+type hostSpyProvider struct {
+	seen *string
+}
+
+func (p *hostSpyProvider) Name() string                                             { return "spy" }
+func (p *hostSpyProvider) Description() string                                      { return "records the gated host" }
+func (p *hostSpyProvider) InjectAuth(_ *http.Request, _ authreq.ProviderArgs) error { return nil }
+
+func (p *hostSpyProvider) AuthorizesHost(_ context.Context, host string, _ authreq.ProviderArgs) (bool, error) {
+	*p.seen = host
+
+	return false, nil
+}
+
+// TestExecute_HostGateSeesTheProjectedHost pins the transport to one derivation
+// of the request authority. The view the action gate judges lower-cases the
+// hostname and req.URL.Hostname() keeps the URL's own case, so a mixed-case URL
+// is the input the two differ on: the host gate must be handed the same string
+// the action gate will read, not a second reading of the URL. The provider
+// denies, so the recorder is reached before any dial and the host never has to
+// resolve.
+func TestExecute_HostGateSeesTheProjectedHost(t *testing.T) {
+	t.Parallel()
+
+	var seen string
+
+	args := makeArgs(t, map[string]any{
+		"url":           "https://API.Example.com/p",
+		"auth_provider": "spy",
+	})
+
+	_, _, _ = NewClient().Execute(context.Background(), args, []auth.Provider{&hostSpyProvider{seen: &seen}})
+
+	if seen != "api.example.com" {
+		t.Fatalf("host gate saw %q, want the view's hostname; the transport must derive the authority once", seen)
 	}
 }

@@ -671,3 +671,54 @@ func TestAuthorizeAction_NonAPIPath_FailsClosed(t *testing.T) {
 		t.Fatalf("AuthorizeAction(/-/jobs/artifacts/x) = %v, want ErrUnclassifiable", err)
 	}
 }
+
+func TestValidateGitLabHosts(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		host    string
+		apiHost string
+		want    error // nil when the authority is admitted.
+	}{
+		{"plain host", "gitlab.com", "", nil},
+		{"host with port", "gitlab.internal:8443", "", nil},
+		{"punycode host", "xn--i-9bb.example", "", nil},
+		{"empty api host is allowed", "gitlab.com", "", nil},
+		{"ASCII host and api host both set", "gitlab.internal", "api.gitlab.internal", nil},
+		{"bracketed ipv6 host with no zone", "[2001:db8::1]:8443", "", nil},
+		// A bracketed literal with no port: [net.SplitHostPort] fails on it, so
+		// the brackets come off only because stripHostPort takes them off, and
+		// [netip.ParseAddr] refuses a bracketed string. Left on, the zone rows
+		// below would parse as no address at all and be admitted.
+		{"bracketed ipv6 host with no port", "[2001:db8::1]", "", nil},
+		{"zoned served host with no port", "[fe80::1%eth0]", "", ErrZonedHost},
+		{"zoned served api host with no port", "gitlab.com", "[fe80::1%eth0]", ErrZonedHost},
+		{"percent-escaped zone with no port", "gitlab.com", "[fe80::1%25eth0]", ErrZonedHost},
+		{"non-ASCII served host", "g\u0130tlab.internal.example", "", ErrNonASCIIHost},
+		{"non-ASCII served api host", "gitlab.com", "api.g\u0130tlab.example", ErrNonASCIIHost},
+		// A zone is stripped of its brackets and its port like any other host,
+		// so the served authority reaching AdmitHost still carries it.
+		{"zoned served host", "[fe80::1%eth0]:8443", "", ErrZonedHost},
+		{"zoned served api host", "gitlab.com", "[fe80::1%eth0]:8443", ErrZonedHost},
+		// api_host is what gets pinned, advertised, probed and dialed, so an
+		// ASCII api_host leaves nothing non-ASCII on the request path even when
+		// host is an internationalized name.
+		{
+			"non-ASCII host behind an ASCII api host",
+			"gitlab.b\u00fccher.example", "gitlab.xn--bcher-kva.example", nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateGitLabHosts(tc.host, tc.apiHost)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("validateGitLabHosts(%q, %q) = %v, want %v",
+					tc.host, tc.apiHost, err, tc.want)
+			}
+		})
+	}
+}

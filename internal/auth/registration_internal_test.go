@@ -772,6 +772,95 @@ func TestGitlabOutcome_Skips(t *testing.T) {
 	})
 }
 
+// TestGitlabOutcome_HostAdmissionPrecedesDiscovery pins where the served
+// authority is admitted, not only that it is. discoverGitLab hands that
+// authority to glab as GITLAB_API_HOST, and glabLoginHost passes it as
+// GITLAB_HOST too whenever the config host is the default, so a check that ran
+// only inside buildGitLab would let the operator's credential store be queried
+// for a host this system will not talk to.
+//
+// The rejected shape is paired with an api_host as well as with a host,
+// because api_host is the served authority whenever it is set and
+// glabLoginHost forwards that same api_host as the login host whenever the
+// configured host is empty or the gitlab.com default. Rows that populate only
+// host cannot tell validateGitLabHosts(host, glCfg.APIHost) apart from
+// validateGitLabHosts(host, ""), and the second restores the bug this call
+// site exists to fix.
+//
+// The discovery stub records the call rather than failing inside itself, so
+// each way of getting this wrong fails on its own assertion: move the check
+// back below discovery and discovered goes true; delete it and the default
+// stubs carry the run through to an Available status.
+func TestGitlabOutcome_HostAdmissionPrecedesDiscovery(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name, host, apiHost, wantKey string
+	}{
+		{"non-ASCII host", "g\u0130tlab.example", "", "connectors.gitlab.host"},
+		{"zoned host", "[fe80::1%eth0]:8443", "", "connectors.gitlab.host"},
+		// host unset: resolveGitLabHost defaults it to gitlab.com and
+		// glabLoginHost hands glab the api_host instead.
+		{"non-ASCII api host, no host", "", "api.g\u0130tlab.example", "connectors.gitlab.api_host"},
+		{"zoned api host, no host", "", "[fe80::1%eth0]:8443", "connectors.gitlab.api_host"},
+		// host written out as the default it would have defaulted to.
+		{"non-ASCII api host, default host", "gitlab.com", "api.g\u0130tlab.example", "connectors.gitlab.api_host"},
+		// No port on the literal: [net.SplitHostPort] fails on it, so only
+		// unbracketing reaches the address underneath.
+		{"zoned api host with no port", "gitlab.com", "[fe80::1%25eth0]", "connectors.gitlab.api_host"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			d := stubDeps()
+
+			discovered := false
+			d.discoverGitLab = func(string, string) (glabCredential, error) {
+				discovered = true
+
+				return glabCredential{AccessToken: "glpat-x"}, nil //nolint:exhaustruct // env PAT.
+			}
+
+			//nolint:exhaustruct // the two hosts are the whole configuration under test.
+			cfg := GitLabHardeningConfig{Host: tc.host, APIHost: tc.apiHost}
+			got := d.gitlabOutcome(context.Background(), cfg, false)
+
+			wantLoudSkip(t, got)
+			if discovered {
+				t.Fatalf("host %q / api_host %q reached the credential store before it was admitted",
+					tc.host, tc.apiHost)
+			}
+			reason := got.statuses[0].Reason
+			if !strings.Contains(reason, "host admission failed") {
+				t.Fatalf("reason %q must name the admission failure", reason)
+			}
+			if !strings.Contains(reason, tc.wantKey) {
+				t.Fatalf("reason %q must name the rejected key %q", reason, tc.wantKey)
+			}
+		})
+	}
+}
+
+// TestGitlabOutcome_AdmittedHostStillDiscovers is the false-denial half: the
+// admission call added above must not turn an ordinary configuration away. A
+// self-managed instance on a non-default port is the case with the most moving
+// parts, since the served authority carries a port that the host itself does
+// not.
+func TestGitlabOutcome_AdmittedHostStillDiscovers(t *testing.T) {
+	t.Parallel()
+
+	d := stubDeps()
+	//nolint:exhaustruct // the two hosts are the whole configuration under test.
+	cfg := GitLabHardeningConfig{Host: "gitlab.internal:8443", APIHost: "api.gitlab.internal:8443"}
+	got := d.gitlabOutcome(context.Background(), cfg, false)
+
+	if len(got.providers) != 1 || !got.statuses[0].Available {
+		t.Fatalf("want an available gitlab provider, got %+v", got)
+	}
+}
+
 func TestRegisterAWS_ScopeDegraded_rendersDisabledStillAvailable(t *testing.T) {
 	t.Parallel()
 	d := stubDeps()

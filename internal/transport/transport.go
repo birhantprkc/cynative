@@ -114,7 +114,7 @@ type KeyValue struct {
 type RequestArgs struct {
 	Method string `json:"method" jsonschema:"enum=GET,enum=POST,enum=PUT,enum=DELETE,enum=PATCH,enum=HEAD,enum=OPTIONS" jsonschema_description:"The HTTP method to use."` //nolint:lll // struct tags are indivisible
 
-	URL string `json:"url" jsonschema_description:"The full URL to request (e.g. \"https://api.example.com:8080/v1/users?q=hello\"). Must not embed userinfo (user:pass@): credentials are injected automatically by the auth_provider and model-supplied ones are rejected."` //nolint:lll // struct tags are indivisible
+	URL string `json:"url" jsonschema_description:"The full URL to request (e.g. \"https://api.example.com/v1/users?q=hello\"). Must not embed userinfo (user:pass@): credentials are injected automatically by the auth_provider and model-supplied ones are rejected. The host must be ASCII; write an internationalized host in its punycode (xn--) form. github, aws, gcp and azure require the default https port 443; gitlab and the Kubernetes connectors accept the port their connector is configured with. Write a port in its canonical form (:443, never :0443), since the port is matched as written."` //nolint:lll // struct tags are indivisible
 
 	Headers []KeyValue `json:"headers,omitempty" jsonschema_description:"List of HTTP headers. Omit if none. Never include Host: the request authority is derived from url, and a model-supplied Host header is rejected. Never include credential headers (Authorization, Proxy-Authorization, X-Ms-Authorization-Auxiliary, Private-Token, Job-Token): credentials are injected automatically by the auth_provider and model-supplied ones are rejected."` //nolint:lll // struct tags are indivisible
 	Body    string     `json:"body,omitempty"    jsonschema_description:"The request body as a string. Omit if none."`
@@ -227,13 +227,23 @@ func (c *Client) do(
 		return nil, 0, noop, fmt.Errorf("http_request requires an https URL, got scheme %q", req.URL.Scheme)
 	}
 
+	// Checked on the raw hostname, before anything lower-cases it: Go's case
+	// mapping and the IDNA conversion the client applies before it dials do not
+	// agree on every host, and an IP zone identifier is matched exactly rather
+	// than case-insensitively, so a host normalized here could be classified as
+	// a name, or an interface, that the wire never reaches. Same class as #243
+	// and #247.
+	if admitErr := auth.AdmitHost(req.URL.Hostname()); admitErr != nil {
+		return nil, 0, noop, fmt.Errorf("http_request: %w", admitErr)
+	}
+
 	// rawArgs is needed by AuthorizeHost, auth.Inject, and configureTransport,
 	// so it is computed once here.
 	rawArgs := json.RawMessage(arguments)
 
 	v := authreq.NewView(req, viewBody)
 
-	if hostErr := auth.AuthorizeHost(ctx, args.AuthProvider, req.URL.Hostname(), providers, rawArgs); hostErr != nil {
+	if hostErr := auth.AuthorizeHost(ctx, args.AuthProvider, v.Hostname, providers, rawArgs); hostErr != nil {
 		return nil, 0, noop, hostErr
 	}
 
