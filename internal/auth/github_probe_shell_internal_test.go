@@ -11,9 +11,16 @@ import (
 func TestGuardedGithubClient(t *testing.T) {
 	t.Parallel()
 
-	c := guardedGithubClient()
+	c := guardedGithubClient(NoProxy())
 	if !errors.Is(c.CheckRedirect(nil, nil), http.ErrUseLastResponse) {
 		t.Fatal("guarded client must refuse redirects")
+	}
+
+	// The client is bound once to the route of githubUserURL and then used for
+	// githubRateLimitURL as well, so the two must name the same host: a proxied
+	// policy would otherwise send the rate-limit probe down the /user route.
+	if user, rate := mustURL(githubUserURL), mustURL(githubRateLimitURL); user.Host != rate.Host {
+		t.Fatalf("probe URLs name different hosts: %q and %q", user.Host, rate.Host)
 	}
 
 	tr, _ := c.Transport.(*http.Transport)

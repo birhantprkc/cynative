@@ -8,7 +8,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/aws/smithy-go/logging"
 	"golang.org/x/oauth2/google"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
@@ -133,7 +132,7 @@ func GetProviders(cfg HardeningConfig, verbose bool, onStatus func(ConnectorStat
 		func() connectorOutcome { return deps.registerGCP(ctx, verbose) },
 		func() connectorOutcome { return deps.registerAzure(ctx, verbose) },
 		func() connectorOutcome { return deps.registerKube(verbose) },
-	}, onStatus)
+	}, scrubStatus(deps.egress, onStatus))
 }
 
 // buildRegistrationDeps wires the real I/O seams for the registration router and
@@ -141,6 +140,11 @@ func GetProviders(cfg HardeningConfig, verbose bool, onStatus func(ConnectorStat
 // builders set the per-provider clusterRole fields the registration router does
 // not touch. Shell only.
 func buildRegistrationDeps(cfg HardeningConfig) *registrationDeps {
+	egress := cfg.Egress
+	if egress == nil {
+		egress = NoProxy()
+	}
+
 	// Resolve the Azure target cloud once (config override → AZURE_AUTHORITY_HOST →
 	// az CLI config → public) and thread it to the credential chain, the probe
 	// scope, and both the azure/aks providers — matching tryRegisterAzure.
@@ -152,17 +156,20 @@ func buildRegistrationDeps(cfg HardeningConfig) *registrationDeps {
 		homeDir:                homeDirOrEmpty(),
 		awsDefaultProfileCreds: awsDefaultProfileFileHasCreds(),
 		scopeNotifyOut:         os.Stderr,
+		egress:                 egress,
 
-		tokenForHost:   resolveGithubToken,
-		validateGithub: validateGithubToken,
+		tokenForHost: resolveGithubToken,
+		validateGithub: func(ctx context.Context, token string) (string, error) {
+			return validateGithubToken(ctx, token, egress)
+		},
 
 		discoverGitLab: discoverGitLabCred,
-		buildGitLab:    buildGitLabProvider,
+		buildGitLab: func(c GitLabHardeningConfig, host string, cred glabCredential) (*gitlabProvider, error) {
+			return buildGitLabProvider(c, host, cred, egress)
+		},
 		validateGitLab: validateGitLabToken,
 
-		loadAWS: func(ctx context.Context) (aws.Config, error) {
-			return awsconfig.LoadDefaultConfig(ctx, awsconfig.WithLogger(logging.Nop{}))
-		},
+		loadAWS: func(ctx context.Context) (aws.Config, error) { return loadAWSDefaultConfig(ctx, egress) },
 		retrieveAWS: func(ctx context.Context, c aws.Config) error {
 			_, err := c.Credentials.Retrieve(ctx)
 
@@ -173,33 +180,40 @@ func buildRegistrationDeps(cfg HardeningConfig) *registrationDeps {
 			return resolveScopeAWS(ctx, account, rawARN, cfg.AWS.PolicyARN, c)
 		},
 		buildAWS: func(c aws.Config, scoped aws.CredentialsProvider) (*awsProvider, *eksProvider) {
-			hardened := buildHardenedAWSProvider(c, cfg.AWS, scoped)
+			hardened := buildHardenedAWSProvider(c, cfg.AWS, scoped, egress)
 			eks := newEKSProvider(c)
 			eks.clusterRole = cfg.EKS.ClusterRole
+			eks.egress = egress
 
 			return hardened, eks
 		},
 		awsPolicyARN:      cfg.AWS.PolicyARN,
 		validateAWSPolicy: validateAWSPolicy,
 
-		// withBoundedTokenRefresh gives the retained session token source a
-		// client-side HTTP timeout, so every refresh is bounded even though ctx is
-		// (deliberately) deadline-free and oauth2.TokenSource.Token takes no context.
+		// withRefreshClient gives the retained session token source a client-side
+		// HTTP timeout and the operator's proxy route, so every refresh is bounded
+		// and routed even though ctx is (deliberately) deadline-free and
+		// oauth2.TokenSource.Token takes no context.
 		findGCP: func(ctx context.Context) (*google.Credentials, error) {
-			return google.FindDefaultCredentials(withBoundedTokenRefresh(ctx), gcpScope)
+			return google.FindDefaultCredentials(egress.withRefreshClient(ctx), gcpScope)
 		},
-		probeGCP:    probeGCPToken,
-		gcpIdentity: gcpRegistrationIdentity,
+		probeGCP: func(ctx context.Context) error { return probeGCPToken(egress.withRefreshClient(ctx)) },
+		gcpIdentity: func(ctx context.Context, creds *google.Credentials) string {
+			return gcpRegistrationIdentity(ctx, creds, egress)
+		},
 		buildGCP: func(creds *google.Credentials) (*gcpProvider, *gkeProvider) {
 			gke := newGKEProvider(creds.TokenSource)
 			gke.clusterRole = cfg.GKE.ClusterRole
+			gke.egress = egress
 
-			return buildHardenedGCPProvider(creds.TokenSource, cfg.GCP), gke
+			return buildHardenedGCPProvider(creds.TokenSource, cfg.GCP, egress), gke
 		},
 		gcpRole:         cfg.GCP.Role,
-		validateGCPRole: validateGCPRole,
+		validateGCPRole: func(ctx context.Context, role string) error { return validateGCPRole(ctx, role, egress) },
 
-		newAzure: func() (azcore.TokenCredential, error) { return azurehardening.NewCredentialChain(azureCloud) },
+		newAzure: func() (azcore.TokenCredential, error) {
+			return azurehardening.NewCredentialChain(egress.azureClientOptions(azurehardening.ToSDKCloud(azureCloud)))
+		},
 		probeAzure: func(ctx context.Context, cred azcore.TokenCredential) error {
 			return probeAzureToken(ctx, cred, azureCloud.Scope)
 		},
@@ -209,18 +223,20 @@ func buildRegistrationDeps(cfg HardeningConfig) *registrationDeps {
 		buildAzure: func(cred azcore.TokenCredential) (*azureProvider, *aksProvider) {
 			aks := newAKSProvider(cred, azurehardening.ToSDKCloud(azureCloud))
 			aks.clusterRole = cfg.AKS.ClusterRole
+			aks.egress = egress
 
-			return buildHardenedAzureProvider(cred, cfg.Azure, azureCloud), aks
+			return buildHardenedAzureProvider(cred, cfg.Azure, azureCloud, egress), aks
 		},
 		azureRoleDefinition: cfg.Azure.RoleDefinition,
 		validateAzureRole: func(ctx context.Context, cred azcore.TokenCredential, roleDef string) (string, error) {
-			return validateAzureRole(ctx, cred, azureCloud, roleDef)
+			return validateAzureRole(ctx, cred, azureCloud, roleDef, egress)
 		},
 
 		loadKube: loadSelectedCluster,
 		buildKube: func(rc resolvedCluster) *kubernetesProvider {
 			p := newKubernetesProvider(rc)
 			p.clusterRole = cfg.Kubernetes.ClusterRole
+			p.egress = egress
 
 			return p
 		},
@@ -229,6 +245,12 @@ func buildRegistrationDeps(cfg HardeningConfig) *registrationDeps {
 		},
 		k8sClusterRole: cfg.Kubernetes.ClusterRole,
 	}
+}
+
+// loadAWSDefaultConfig loads the AWS SDK's default configuration with the
+// options the policy composes. Shell: the real LoadDefaultConfig.
+func loadAWSDefaultConfig(ctx context.Context, e *Egress) (aws.Config, error) {
+	return awsconfig.LoadDefaultConfig(ctx, e.awsConfigOptions()...)
 }
 
 // validateAWSIdentity is the AWS registration liveness check that also returns a
@@ -271,14 +293,17 @@ func resolveScopeAWS(
 // creds.ProjectID, falling back to the prober's resolved project (quota_project_id,
 // e.g. for gcloud authorized-user ADC where creds.ProjectID is empty). Probe
 // failure degrades to project-only (or ""). Display-only; never fails
-// registration. The caller bounds ctx (identityProbeTimeout).
-func gcpRegistrationIdentity(ctx context.Context, creds *google.Credentials) string {
+// registration. The caller bounds ctx (identityProbeTimeout). The tokeninfo call
+// and the ADC refresh the probe triggers both follow the egress policy.
+func gcpRegistrationIdentity(ctx context.Context, creds *google.Credentials, e *Egress) string {
 	project := ""
 	if creds != nil {
 		project = creds.ProjectID
 	}
-	prober := gcphardening.NewIdentityProber(gcphardening.IdentityConfig{}) //nolint:exhaustruct // defaults.
-	principal, probeProject, _ := prober.Probe(ctx)
+	prober := gcphardening.NewIdentityProber(gcphardening.IdentityConfig{
+		HTTPClient: e.HTTPClient(identityProbeHTTPTimeout),
+	})
+	principal, probeProject, _ := prober.Probe(e.withRefreshClient(ctx))
 	if project == "" {
 		// gcloud authorized-user ADC leaves creds.ProjectID empty; the prober
 		// resolves the active project (quota_project_id), so fall back to it.

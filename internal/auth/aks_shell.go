@@ -4,10 +4,22 @@ import (
 	"context"
 	"net/netip"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/containerservice/armcontainerservice/v9"
 
 	k8sauthz "github.com/cynative/cynative/internal/auth/k8s"
 )
+
+// defaultNewClient is the production ARM client factory: the real constructor
+// on the provider's routed transport. Shell: it exists only to bind the
+// policy without a branch in the covered constructor.
+func (p *aksProvider) defaultNewClient(
+	subscriptionID string, cred azcore.TokenCredential, sdkCloud cloud.Configuration,
+) (*armcontainerservice.ManagedClustersClient, error) {
+	return defaultAKSNewManagedClustersClient(subscriptionID, cred, p.egress.azureClientOptions(sdkCloud))
+}
 
 // defaultFetchView fetches the AKS cluster's configured ClusterRole (default `view`). AKS may
 // authenticate via a local-account bearer token, local-account mTLS, or an
@@ -27,7 +39,12 @@ func (p *aksProvider) defaultFetchView(ctx context.Context, args *AKSAuthArgs) (
 
 	conn := aksClusterConn(cfg.Host, caData, clientCert, clientKey)
 
-	hc, err := pinnedHTTPClient(conn.caData, conn.clientCert, conn.clientKey, conn.serverName, control)
+	route, err := p.egress.RouteEndpoint(conn.endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	hc, err := pinnedHTTPClient(conn.caData, conn.clientCert, conn.clientKey, conn.serverName, route, control)
 	if err != nil {
 		return nil, err
 	}

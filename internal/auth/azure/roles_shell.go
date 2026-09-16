@@ -17,7 +17,7 @@ import (
 // document and GCP's GetRole.
 type RoleClientConfig struct {
 	Endpoint   string                 // test override; "" uses the cloud's ARM host.
-	HTTPClient *http.Client           // test override.
+	HTTPClient *http.Client           // the egress policy's routed client; nil uses azcore's default.
 	Credential azcore.TokenCredential // home-tenant ARM credential; nil → NewCredentialChain.
 	Cloud      CloudConfig            // resolved cloud; its ARM endpoint/audience + AAD authority target the role-defs client.
 }
@@ -44,11 +44,7 @@ type roleClientImpl struct {
 func NewRoleClient(cfg RoleClientConfig) (roleClient, error) {
 	cred := cfg.Credential
 	if cred == nil {
-		cc := cfg.Cloud
-		if cc.Name == "" {
-			cc = ResolveCloudConfig(CloudPublic, "", nil)
-		}
-		dc, err := NewCredentialChain(cc)
+		dc, err := NewCredentialChain(defaultChainOptions(cfg))
 		if err != nil {
 			return nil, fmt.Errorf("default credential: %w", err)
 		}

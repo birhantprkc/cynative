@@ -241,7 +241,7 @@ func loggingToolFunc(it schema.InvokableTool, name string, sink audit.Sink, newI
 			SessionID: scope.SessionID, RunID: scope.RunID, CallID: callID, Depth: scope.Depth,
 			Phase: audit.PhaseResult, Via: audit.ViaCodeExecution, Tool: name,
 			Arguments: audit.RawArgs(argsJSON), Decision: innerResultDecision(ctx), RedactArgs: true,
-			Outcome: inner.outcome, Result: inner.result,
+			Outcome: inner.outcome, Result: inner.result, Route: inner.route,
 		}
 		if err := sink.Log(result); err != nil {
 			if hasFatal {
@@ -255,22 +255,25 @@ func loggingToolFunc(it schema.InvokableTool, name string, sink audit.Sink, newI
 	}
 }
 
-// innerOutcome is one audited inner sandbox call's result: its output, error, and the
-// classified audit outcome/result strings.
+// innerOutcome is one audited inner sandbox call's result: its output, error, the
+// classified audit outcome/result strings, and the egress route the call took.
 type innerOutcome struct {
 	out     string
 	err     error
 	outcome string
 	result  string
+	route   string
 }
 
 // runInnerCall executes one inner tool under its own failure recorder so a 4xx (a
 // failure with no Go error) shows up in this call's audit outcome rather than "ok", then
 // propagates that recorder's tallies to the outer code_execution recorder (a per-call
 // recorder, not a shared-counter delta, so concurrent siblings do not race) and
-// classifies the outcome.
+// classifies the outcome. The call also gets its own route recorder, so the route
+// it reports is the one this request took rather than a sibling's.
 func runInnerCall(ctx context.Context, base sandbox.ToolFunc, argsJSON string) innerOutcome {
 	innerCtx, innerFail := audit.WithFailure(ctx)
+	innerCtx, innerRoute := audit.WithRoute(innerCtx)
 	out, rerr := base(innerCtx, argsJSON)
 	for range innerFail.Count() {
 		audit.MarkFailed(ctx)
@@ -281,12 +284,18 @@ func runInnerCall(ctx context.Context, base sandbox.ToolFunc, argsJSON string) i
 
 	switch {
 	case rerr != nil:
-		return innerOutcome{out: out, err: rerr, outcome: audit.OutcomeError, result: rerr.Error()}
+		return innerOutcome{
+			out:     out,
+			err:     rerr,
+			outcome: audit.OutcomeError,
+			result:  rerr.Error(),
+			route:   innerRoute.Value(),
+		}
 	case innerFail.Failed():
 		// A rejected response (4xx/5xx) — the body is still the result.
-		return innerOutcome{out: out, err: nil, outcome: audit.OutcomeError, result: out}
+		return innerOutcome{out: out, err: nil, outcome: audit.OutcomeError, result: out, route: innerRoute.Value()}
 	default:
-		return innerOutcome{out: out, err: nil, outcome: audit.OutcomeOK, result: out}
+		return innerOutcome{out: out, err: nil, outcome: audit.OutcomeOK, result: out, route: innerRoute.Value()}
 	}
 }
 

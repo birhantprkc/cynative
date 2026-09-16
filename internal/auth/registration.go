@@ -31,6 +31,8 @@ type registrationDeps struct {
 	// scopeNotifyOut receives the one-line startup credential-scope degrade notice
 	// for AWS. Set to os.Stderr in buildRegistrationDeps and io.Discard in stubDeps.
 	scopeNotifyOut io.Writer
+	// egress is the operator's routing policy, threaded to every bootstrap client and provider.
+	egress *Egress
 
 	tokenForHost   func(ctx context.Context) (token string, present bool, err error)
 	validateGithub func(ctx context.Context, token string) (login string, err error)
@@ -70,6 +72,11 @@ type registrationDeps struct {
 // identityProbeTimeout bounds each connector's display-only identity capture so a
 // slow tokeninfo/token-acquire cannot stall startup past the liveness budget.
 const identityProbeTimeout = credentialProbeTimeout
+
+// identityProbeHTTPTimeout is the per-request budget of the GCP identity
+// prober's tokeninfo client, mirroring the subpackage default the routed client
+// replaces.
+const identityProbeHTTPTimeout = 30 * time.Second
 
 // skipOutcome builds a single-status outcome for a skipped connector, computing
 // visibility from the (already-escalated) policy via the same shouldEmit primitive
@@ -212,8 +219,8 @@ func (d *registrationDeps) registerGCP(ctx context.Context, verbose bool) connec
 	// tokens from it for the whole session. Only the probe is bounded — and it
 	// builds a SEPARATE source (probeGCPToken), so cancelling pctx never poisons
 	// the registered source. The production findGCP still bounds each refresh via a
-	// per-request client timeout (withBoundedTokenRefresh) rather than a ctx
-	// deadline, which would poison the retained source.
+	// per-request client timeout (withRefreshClient) rather than a ctx deadline,
+	// which would poison the retained source.
 	creds, findErr := d.findGCP(ctx)
 
 	var probeErr error
@@ -398,7 +405,7 @@ func (d *registrationDeps) githubOutcome(
 
 	exposure := githubhardening.BuildExposure(ghCfg.Permissions)
 	posture, warn := githubPosture(exposure, ghCfg.Permissions)
-	tables := cache.NewTableCache(ghCfg.Config, newGithubOpenAPIFetcher(),
+	tables := cache.NewTableCache(ghCfg.Config, newGithubOpenAPIFetcher(d.egress),
 		githubhardening.DistillOpenAPI, (*githubhardening.Table).Serialize,
 		githubhardening.UnmarshalTable, githubhardening.AdmitTable)
 	gh := newGithubProvider(token, exposure, tables)
