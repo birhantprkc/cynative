@@ -30,6 +30,8 @@ $ErrorActionPreference = 'Stop'
 
 $bucketUrl = 'https://github.com/cynative/scoop-bucket'
 
+. (Join-Path (Join-Path $PSScriptRoot 'lib') 'scoop-install-record.ps1')
+
 # Existence that does not follow the target: Test-Path is false for a dangling
 # symlink or reparse point, which the pollution guards, the post-uninstall
 # asserts, and cleanup must all still see. Enumerate the parent's directory
@@ -214,9 +216,12 @@ try {
     # bucket. Only a polluted local machine with a same-named app in another
     # bucket could violate this (the fresh runner has just main + cynative),
     # but green-lighting the wrong channel would defeat the smoke.
-    $installJsonPath = Join-Path $appDir 'current\install.json'
-    if (-not (Test-Path -LiteralPath $installJsonPath)) {
-        throw "install metadata missing: $installJsonPath"
+    #
+    # Scoop 0.6.0 renamed its install record; the lookup that accepts both names
+    # is in test/lib/scoop-install-record.ps1, which has Pester coverage.
+    $installJsonPath = Get-CynSmokeScoopInstallRecord -Dir (Join-Path $appDir 'current')
+    if (-not $installJsonPath) {
+        throw "install metadata missing: neither scoop-install.json nor install.json under $(Join-Path $appDir 'current')"
     }
     $installRaw = Get-Content -LiteralPath $installJsonPath -Raw
     if ($installRaw -notmatch '^\s*\{') {
